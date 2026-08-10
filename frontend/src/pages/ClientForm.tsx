@@ -44,6 +44,15 @@ interface Plan {
   durationDays?: number;
 }
 
+interface ServerDevice {
+  id: number;
+  name: string;
+  region: string;
+  isEnabled: boolean;
+  isOnline: boolean;
+  status: string;
+}
+
 type ImageKey = 'idFrontImage' | 'idBackImage' | 'contractFrontImage' | 'contractBackImage';
 
 interface FormState {
@@ -78,6 +87,8 @@ interface FormState {
   idBackImage: string;
   contractFrontImage: string;
   contractBackImage: string;
+  /** معرف سيرفر MikroTik المرتبط بالمنطقة المختارة */
+  mikroTikServerId: number | '';
 }
 
 const empty: FormState = {
@@ -112,6 +123,7 @@ const empty: FormState = {
   idBackImage: '',
   contractFrontImage: '',
   contractBackImage: '',
+  mikroTikServerId: '',
 };
 
 function ImageBox({
@@ -183,7 +195,10 @@ export default function ClientForm() {
   const [step, setStep] = useState(0); // 0 = رقم وطني, 1 = بيانات
   const [form, setForm] = useState<FormState>(empty);
   const [plans, setPlans] = useState<Plan[]>([]);
+  const [regions, setRegions] = useState<string[]>([]);
+  const [servers, setServers] = useState<ServerDevice[]>([]);
   const [loading, setLoading] = useState(false);
+  const [identifiersLoading, setIdentifiersLoading] = useState(false);
   const [error, setError] = useState('');
   const [showPass, setShowPass] = useState(false);
   const [successOpen, setSuccessOpen] = useState(false);
@@ -195,21 +210,107 @@ export default function ClientForm() {
       const list = Array.isArray(body) ? body : body?.data ?? body?.Data ?? [];
       setPlans(Array.isArray(list) ? list : []);
     }).catch(() => {});
+
+    // السيرفرات + المدن من MikroTik
+    api.get('/mikrotik-devices').then((res) => {
+      const body = res.data;
+      const list = Array.isArray(body) ? body : body?.data ?? body?.Data ?? [];
+      const devices = Array.isArray(list) ? list : [];
+      const normalized: ServerDevice[] = devices.map((d: any) => ({
+        id: Number(d.id ?? d.Id),
+        name: String(d.name ?? d.Name ?? ''),
+        region: String(d.region ?? d.Region ?? d.location ?? d.Location ?? '').trim(),
+        isEnabled: d.isEnabled === true || d.IsEnabled === true,
+        isOnline: d.isOnline === true || d.IsOnline === true || d.status === 'Online' || d.Status === 'Online',
+        status: String(d.status ?? d.Status ?? ''),
+      })).filter((d: ServerDevice) => d.id > 0 && d.region.length > 0);
+
+      setServers(normalized);
+      const unique = Array.from(new Set(normalized.map((d) => d.region)))
+        .sort((a, b) => a.localeCompare(b, 'ar'));
+      setRegions(unique);
+    }).catch(() => {
+      setServers([]);
+      setRegions([]);
+    });
   }, []);
 
-  // توليد اسم المستخدم وكلمة المرور عند إدخال الرقم الوطني
-  useEffect(() => {
-    if (form.nationalId.length === 11 && /^\d{11}$/.test(form.nationalId)) {
+  /** اختيار أفضل سيرفر في المنطقة: مفعّل + أونلاين إن أمكن */
+  const pickServerForRegion = (region: string): number | '' => {
+    const inRegion = servers.filter((s) => s.region === region);
+    if (!inRegion.length) return '';
+    const preferred =
+      inRegion.find((s) => s.isEnabled && s.isOnline) ||
+      inRegion.find((s) => s.isEnabled) ||
+      inRegion[0];
+    return preferred?.id ?? '';
+  };
+
+  const handleCityChange = (city: string) => {
+    const serverId = city ? pickServerForRegion(city) : '';
+    setForm((prev) => ({
+      ...prev,
+      city,
+      mikroTikServerId: serverId,
+    }));
+  };
+
+  /** توليد كلمة مرور رقمية من 6 خانات */
+  const generatePassword = () => String(Math.floor(100000 + Math.random() * 900000));
+
+  /**
+   * عند إدخال رقم وطني صالح:
+   * - جلب اسم المستخدم التالي (03310011711-2@sham.net إن وُجد -1)
+   * - توليد رقم عقد فريد
+   * - توليد كلمة مرور ووضعها أيضاً في تأكيد كلمة المرور
+   */
+  const loadNextIdentifiers = async (nationalId: string) => {
+    setIdentifiersLoading(true);
+    setError('');
+    try {
+      const res = await api.get('/clients/next-identifiers', { params: { nationalId } });
+      const body = res.data;
+      const data = body?.data ?? body?.Data ?? body;
+      const username = data?.username ?? data?.Username ?? `${nationalId}-1@sham.net`;
+      const contractNumber = data?.contractNumber ?? data?.ContractNumber ?? '';
+      const password = generatePassword();
+
       setForm((prev) => ({
         ...prev,
-        username: prev.username || `${form.nationalId}-1@sham.net`,
-        password: prev.password || String(Math.floor(100000 + Math.random() * 900000)),
+        nationalId,
+        username,
+        contractNumber,
+        password,
+        passwordConfirm: password, // نفس كلمة المرور المولّدة
       }));
+    } catch (err: any) {
+      // احتياطي محلي إن فشل الـ API
+      const password = generatePassword();
+      setForm((prev) => ({
+        ...prev,
+        nationalId,
+        username: `${nationalId}-1@sham.net`,
+        contractNumber: String(Math.floor(1 + Math.random() * 999999)).padStart(6, '0'),
+        password,
+        passwordConfirm: password,
+      }));
+      const msg = err.response?.data?.message || err.response?.data?.Message;
+      if (msg) setError(msg);
+    } finally {
+      setIdentifiersLoading(false);
     }
-  }, [form.nationalId]);
+  };
 
-  const set = (key: keyof FormState, value: any) =>
-    setForm((prev) => ({ ...prev, [key]: value }));
+  const set = (key: keyof FormState, value: any) => {
+    setForm((prev) => {
+      const next = { ...prev, [key]: value };
+      // عند تغيير كلمة المرور يدوياً — مزامنة التأكيد تلقائياً إن كان مطابقاً للقيمة السابقة
+      if (key === 'password') {
+        next.passwordConfirm = value;
+      }
+      return next;
+    });
+  };
 
   const validateStep0 = () => {
     if (!/^\d{11}$/.test(form.nationalId)) {
@@ -218,6 +319,12 @@ export default function ClientForm() {
     }
     setError('');
     return true;
+  };
+
+  const goToStep1 = async () => {
+    if (!validateStep0()) return;
+    await loadNextIdentifiers(form.nationalId);
+    setStep(1);
   };
 
   const validateStep1 = () => {
@@ -229,6 +336,11 @@ export default function ClientForm() {
     if (!form.birthDate) return setError('تاريخ الولادة مطلوب'), false;
     if (!form.birthPlace.trim()) return setError('محل الولادة مطلوب'), false;
     if (!form.gender) return setError('الجنس مطلوب'), false;
+    if (!form.city.trim()) return setError('المدينة مطلوبة (من مناطق السيرفرات)'), false;
+    if (regions.length > 0 && !regions.includes(form.city))
+      return setError('اختر مدينة من قائمة مناطق السيرفرات فقط'), false;
+    if (!form.mikroTikServerId)
+      return setError('لا يوجد سيرفر MikroTik مرتبط بهذه المنطقة — أضف سيرفرًا للمنطقة أولاً'), false;
     if (!form.idFrontImage || !form.idBackImage) return setError('صور الهوية للوجهين مطلوبة'), false;
     if (!form.freeSubscription && !form.planId) return setError('يجب اختيار باقة أو تفعيل اشتراك مجاني'), false;
     if (form.password && form.password !== form.passwordConfirm)
@@ -277,6 +389,8 @@ export default function ClientForm() {
         idBackImage: form.idBackImage,
         contractFrontImage: form.contractFrontImage || null,
         contractBackImage: form.contractBackImage || null,
+        // ربط العميل بسيرفر المنطقة المختارة
+        mikroTikServerId: form.mikroTikServerId ? Number(form.mikroTikServerId) : null,
       };
       const res = await api.post('/clients', payload);
       const body = res.data;
@@ -333,11 +447,11 @@ export default function ClientForm() {
             <Button
               variant="contained"
               size="large"
-              endIcon={<ArrowForward />}
-              disabled={form.nationalId.length !== 11}
-              onClick={() => { if (validateStep0()) setStep(1); }}
+              endIcon={identifiersLoading ? <CircularProgress size={18} color="inherit" /> : <ArrowForward />}
+              disabled={form.nationalId.length !== 11 || identifiersLoading}
+              onClick={goToStep1}
             >
-              متابعة إلى بيانات العميل
+              {identifiersLoading ? 'جاري التوليد...' : 'متابعة إلى بيانات العميل'}
             </Button>
           </Box>
         </Paper>
@@ -357,7 +471,7 @@ export default function ClientForm() {
             <Grid item xs={12} md={6}>
               <TextField fullWidth label="اسم المستخدم" value={form.username}
                 onChange={(e) => set('username', e.target.value)}
-                helperText="يُنشأ تلقائياً من الرقم الوطني — يمكن تعديله" />
+                helperText="تلقائي: الرقم الوطني-التسلسل@sham.net (يزيد إن وُجد حساب سابق)" />
             </Grid>
             <Grid item xs={12} md={6}>
               <TextField fullWidth select label="الباقة" value={form.planId}
@@ -372,6 +486,7 @@ export default function ClientForm() {
             <Grid item xs={12} md={6}>
               <TextField fullWidth label="كلمة المرور" type={showPass ? 'text' : 'password'} value={form.password}
                 onChange={(e) => set('password', e.target.value)}
+                helperText="مولَّدة تلقائياً — التعديل يحدّث التأكيد أيضاً"
                 InputProps={{
                   endAdornment: (
                     <InputAdornment position="end">
@@ -385,13 +500,41 @@ export default function ClientForm() {
             </Grid>
             <Grid item xs={12} md={6}>
               <TextField fullWidth label="تأكيد كلمة المرور" type={showPass ? 'text' : 'password'}
-                value={form.passwordConfirm} onChange={(e) => set('passwordConfirm', e.target.value)} />
+                value={form.passwordConfirm}
+                onChange={(e) => set('passwordConfirm', e.target.value)}
+                helperText="يُملأ تلقائياً بنفس كلمة المرور المولَّدة"
+              />
             </Grid>
             <Grid item xs={12} md={4}>
-              <TextField fullWidth label="رقم العقد" value={form.contractNumber} onChange={(e) => set('contractNumber', e.target.value)} />
+              <TextField
+                fullWidth
+                label="رقم العقد"
+                value={form.contractNumber}
+                onChange={(e) => set('contractNumber', e.target.value)}
+                helperText="يُولَّد تلقائياً وبشكل فريد — يمكن تعديله"
+                InputProps={{ readOnly: false }}
+              />
             </Grid>
             <Grid item xs={12} md={4}>
-              <TextField fullWidth label="المدينة" value={form.city} onChange={(e) => set('city', e.target.value)} />
+              <TextField
+                fullWidth
+                select
+                label="المدينة *"
+                value={form.city}
+                onChange={(e) => handleCityChange(e.target.value)}
+                helperText={
+                  form.city && form.mikroTikServerId
+                    ? `مرتبط بالسيرفر: ${servers.find((s) => s.id === form.mikroTikServerId)?.name || form.mikroTikServerId}`
+                    : regions.length
+                      ? 'من مناطق السيرفرات — يُربط تلقائياً بسيرفر المنطقة'
+                      : 'لا توجد مناطق — أضف سيرفرات MikroTik أولاً'
+                }
+              >
+                <MenuItem value="">— اختر المدينة —</MenuItem>
+                {regions.map((r) => (
+                  <MenuItem key={r} value={r}>{r}</MenuItem>
+                ))}
+              </TextField>
             </Grid>
             <Grid item xs={12} md={4}>
               <TextField fullWidth label="الشقة / المنطقة" value={form.apartment || form.area}
@@ -555,9 +698,18 @@ export default function ClientForm() {
                 {created?.password}
               </Box>
             </Typography>
+            <Typography sx={{ mt: 1 }}><strong>رقم العقد:</strong> {created?.contractNumber ?? form.contractNumber}</Typography>
             <Typography sx={{ mt: 1 }}><strong>الاسم:</strong> {created?.fullName}</Typography>
             <Typography><strong>الرقم الوطني:</strong> {created?.nationalId}</Typography>
             <Typography><strong>الهاتف:</strong> {created?.phone}</Typography>
+            <Typography><strong>المدينة:</strong> {created?.city ?? form.city}</Typography>
+            <Typography>
+              <strong>السيرفر:</strong>{' '}
+              {servers.find((s) => s.id === (created?.mikroTikServerId ?? form.mikroTikServerId))?.name
+                || created?.mikroTikServerId
+                || form.mikroTikServerId
+                || '—'}
+            </Typography>
           </Paper>
         </DialogContent>
         <DialogActions>

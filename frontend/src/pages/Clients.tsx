@@ -1,4 +1,4 @@
-﻿// frontend/src/pages/Clients.tsx
+// frontend/src/pages/Clients.tsx
 import { useState, useEffect } from 'react';
 import {
     Box,
@@ -27,6 +27,9 @@ import {
     Alert,
     CircularProgress,
     Divider,
+    FormControl,
+    InputLabel,
+    Select,
 } from '@mui/material';
 import {
     Add as AddIcon,
@@ -107,6 +110,8 @@ export default function Clients() {
     const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
     const [permanentDeleteDialogOpen, setPermanentDeleteDialogOpen] = useState(false);
     const [renewDialogOpen, setRenewDialogOpen] = useState(false);
+    const [plans, setPlans] = useState<Plan[]>([]);
+    const [renewPlanId, setRenewPlanId] = useState<number | ''>('');
     const [speedDialogOpen, setSpeedDialogOpen] = useState(false);
     const [resetPasswordDialogOpen, setResetPasswordDialogOpen] = useState(false);
 
@@ -132,8 +137,20 @@ export default function Clients() {
 
     useEffect(() => {
         fetchClients();
+        fetchPlans();
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [page, rowsPerPage, search]);
+
+    const fetchPlans = async () => {
+        try {
+            const response = await api.get('/plans');
+            const body = response.data;
+            const list = Array.isArray(body) ? body : body?.data ?? body?.Data ?? [];
+            setPlans(Array.isArray(list) ? list : []);
+        } catch {
+            setPlans([]);
+        }
+    };
 
     const fetchClients = async () => {
         setLoading(true);
@@ -163,6 +180,8 @@ export default function Clients() {
                     activeSubscription: c.activeSubscription ?? c.ActiveSubscription
                         ? {
                             ...(c.activeSubscription ?? c.ActiveSubscription),
+                            planId: (c.activeSubscription ?? c.ActiveSubscription).planId
+                                ?? (c.activeSubscription ?? c.ActiveSubscription).PlanId,
                             planName: (c.activeSubscription ?? c.ActiveSubscription).planName
                                 ?? (c.activeSubscription ?? c.ActiveSubscription).PlanName,
                             planSpeed: (c.activeSubscription ?? c.ActiveSubscription).planSpeed
@@ -171,6 +190,8 @@ export default function Clients() {
                                 ?? (c.activeSubscription ?? c.ActiveSubscription).EndDate,
                             isActive: (c.activeSubscription ?? c.ActiveSubscription).isActive
                                 ?? (c.activeSubscription ?? c.ActiveSubscription).IsActive,
+                            daysRemaining: (c.activeSubscription ?? c.ActiveSubscription).daysRemaining
+                                ?? (c.activeSubscription ?? c.ActiveSubscription).DaysRemaining,
                         }
                         : null,
                 }));
@@ -447,22 +468,31 @@ export default function Clients() {
 
     // ========== Renew ==========
     const handleRenewClick = () => {
+        const currentPlanId = selectedClient?.activeSubscription?.planId;
+        setRenewPlanId(currentPlanId && currentPlanId > 0 ? currentPlanId : '');
         setRenewDialogOpen(true);
         handleMenuClose();
     };
 
     const handleRenewConfirm = async () => {
         if (!selectedClient) return;
+        if (!renewPlanId) {
+            setError('يجب اختيار باقة للتجديد');
+            return;
+        }
         setSubmitting(true);
         setError('');
         try {
-            await api.post(`/clients/${selectedClient.id}/renew`);
-            setSuccess('تم تجديد الاشتراك وتحديث RADIUS بنجاح');
+            await api.post(`/clients/${selectedClient.id}/renew`, {
+                planId: Number(renewPlanId),
+            });
+            setSuccess('تم تجديد الاشتراك وإضافته لصندوق التفعيل');
             setTimeout(() => setSuccess(''), 3000);
             setRenewDialogOpen(false);
+            setRenewPlanId('');
             fetchClients();
         } catch (err: any) {
-            setError(err.response?.data?.message || 'فشل تجديد الاشتراك');
+            setError(err.response?.data?.message || err.response?.data?.Message || 'فشل تجديد الاشتراك');
         } finally {
             setSubmitting(false);
         }
@@ -1227,17 +1257,34 @@ const handleResetPasswordConfirm = async () => {
             <Dialog
                 open={renewDialogOpen}
                 onClose={() => setRenewDialogOpen(false)}
+                fullWidth
+                maxWidth="sm"
             >
                 <DialogTitle>تجديد الاشتراك</DialogTitle>
                 <DialogContent>
                     <Typography>
-                        هل تريد تجديد اشتراك العميل{' '}
-                        <strong>{selectedClient?.fullName}</strong>؟
+                        تجديد اشتراك العميل{' '}
+                        <strong>{selectedClient?.fullName}</strong>
                     </Typography>
-                    <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-                        سيتم تمديد التاريخ حسب مدة الباقة الحالية وتفعيله في
-                        RADIUS.
+                    <Typography variant="body2" color="text.secondary" sx={{ mt: 1, mb: 2 }}>
+                        اختر الباقة (السرعة). سيتم التمديد حتى الساعة 12 ظهراً في يوم الانتهاء،
+                        وإضافة المبلغ إلى صندوق التفعيلات.
                     </Typography>
+                    <FormControl fullWidth>
+                        <InputLabel>الباقة / السرعة</InputLabel>
+                        <Select
+                            label="الباقة / السرعة"
+                            value={renewPlanId}
+                            onChange={(e) => setRenewPlanId(e.target.value === '' ? '' : Number(e.target.value))}
+                        >
+                            {plans.map((plan) => (
+                                <MenuItem key={plan.id} value={plan.id}>
+                                    {plan.name} — {plan.speed} — {Number(plan.price).toLocaleString()} ل.س
+                                    {plan.durationDays ? ` — ${plan.durationDays} يوم` : ''}
+                                </MenuItem>
+                            ))}
+                        </Select>
+                    </FormControl>
                 </DialogContent>
                 <DialogActions>
                     <Button onClick={() => setRenewDialogOpen(false)}>
@@ -1247,7 +1294,7 @@ const handleResetPasswordConfirm = async () => {
                         onClick={handleRenewConfirm}
                         variant="contained"
                         color="primary"
-                        disabled={submitting}
+                        disabled={submitting || !renewPlanId}
                     >
                         {submitting ? (
                             <CircularProgress size={20} />

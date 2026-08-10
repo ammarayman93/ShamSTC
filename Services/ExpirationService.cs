@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -11,6 +11,10 @@ using Microsoft.EntityFrameworkCore;
 
 namespace ISPSystem.Services
 {
+    /// <summary>
+    /// يفصل العملاء عند انتهاء الاشتراك.
+    /// EndDate مضبوط على الساعة 12:00 ظهراً، فيُفصل العميل عند الظهر في يوم الانتهاء.
+    /// </summary>
     public class ExpirationService : BackgroundService
     {
         private readonly IServiceScopeFactory _scopeFactory;
@@ -24,7 +28,7 @@ namespace ISPSystem.Services
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            _logger.LogInformation("🚀 ExpirationService بدأ العمل");
+            _logger.LogInformation("🚀 ExpirationService بدأ العمل (فصل عند الساعة 12 ظهراً حسب EndDate)");
 
             while (!stoppingToken.IsCancellationRequested)
             {
@@ -36,15 +40,17 @@ namespace ISPSystem.Services
                     var radius = scope.ServiceProvider.GetRequiredService<RadiusService>();
                     var mikroTik = scope.ServiceProvider.GetService<MikroTikService>();
 
-                    // الاشتراكات المنتهية وما زالت Active
+                    var now = DateTime.Now;
+
+                    // الاشتراكات المنتهية (EndDate = يوم الانتهاء 12:00 ظهراً)
                     var expiredSubs = await db.Subscriptions
                         .Include(s => s.Client)
-                        .Where(x => x.EndDate < DateTime.Now && x.IsActive)
+                        .Where(x => x.EndDate <= now && x.IsActive)
                         .ToListAsync(stoppingToken);
 
                     if (expiredSubs.Any())
                     {
-                        _logger.LogInformation("⏰ تم العثور على {Count} اشتراك منتهٍ", expiredSubs.Count);
+                        _logger.LogInformation("⏰ تم العثور على {Count} اشتراك منتهٍ (بعد الظهر أو تجاوز التاريخ)", expiredSubs.Count);
 
                         foreach (var sub in expiredSubs)
                         {
@@ -53,24 +59,22 @@ namespace ISPSystem.Services
 
                             if (sub.Client != null)
                             {
-                                // تعطيل في RADIUS
                                 var disabled = await radius.DisableUser(sub.Client.Username);
                                 await radius.DisconnectUser(sub.Client.Username);
 
-                                // فصل الجلسة على المايكروتيك فوراً
                                 if (mikroTik != null)
                                 {
                                     try { await mikroTik.KickActiveUser(sub.Client.Username); }
-                                    catch (Exception kex) {
+                                    catch (Exception kex)
+                                    {
                                         _logger.LogWarning(kex, "فشل فصل جلسة MikroTik لـ {User}", sub.Client.Username);
                                     }
                                 }
 
-                                // تحديث حالة العميل إذا لم يعد لديه اشتراك نشط
                                 var stillHasActive = await db.Subscriptions
                                     .AnyAsync(s => s.ClientId == sub.ClientId
                                                 && s.IsActive
-                                                && s.EndDate > DateTime.Now, stoppingToken);
+                                                && s.EndDate > now, stoppingToken);
 
                                 if (!stillHasActive)
                                 {
@@ -78,29 +82,28 @@ namespace ISPSystem.Services
                                 }
 
                                 _logger.LogInformation(
-                                    "⛔ تم تعطيل العميل {Username} في RADIUS (نتيجة: {Result})",
-                                    sub.Client.Username, disabled);
+                                    "⛔ تم تعطيل العميل {Username} في RADIUS عند انتهاء الاشتراك ({End:yyyy-MM-dd HH:mm}) (نتيجة: {Result})",
+                                    sub.Client.Username, sub.EndDate, disabled);
                             }
                         }
 
                         await db.SaveChangesAsync(stoppingToken);
                     }
 
-                    // تنبيه الاشتراكات القريبة من الانتهاء (خلال 3 أيام)
                     var expiringSoon = await db.Subscriptions
                         .Include(s => s.Client)
                         .Where(x => x.IsActive
-                                 && x.EndDate > DateTime.Now
-                                 && x.EndDate <= DateTime.Now.AddDays(3))
+                                 && x.EndDate > now
+                                 && x.EndDate <= now.AddDays(3))
                         .ToListAsync(stoppingToken);
 
                     foreach (var sub in expiringSoon)
                     {
                         _logger.LogWarning(
-                            "⚠️ الاشتراك للعميل {Username} ينتهي خلال {Days} أيام",
+                            "⚠️ الاشتراك للعميل {Username} ينتهي في {End:yyyy-MM-dd HH:mm} (خلال {Days} أيام)",
                             sub.Client?.Username,
-                            (sub.EndDate - DateTime.Now).Days);
-                        // هنا يمكن إضافة إشعار لاحقاً
+                            sub.EndDate,
+                            (sub.EndDate - now).Days);
                     }
                 }
                 catch (Exception ex)
@@ -108,8 +111,8 @@ namespace ISPSystem.Services
                     _logger.LogError(ex, "❌ خطأ في ExpirationService");
                 }
 
-                // الانتظار 15 دقيقة بدلاً من 30 (أسرع استجابة)
-                await Task.Delay(TimeSpan.FromMinutes(15), stoppingToken);
+                // كل 5 دقائق لاستجابة أدق حول الساعة 12
+                await Task.Delay(TimeSpan.FromMinutes(5), stoppingToken);
             }
         }
     }

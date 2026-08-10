@@ -34,6 +34,11 @@ namespace ISPSystem.Data
         public DbSet<SalesInvoice> SalesInvoices { get; set; }
         public DbSet<SalesInvoiceItem> SalesInvoiceItems { get; set; }
 
+        // صلاحيات
+        public DbSet<Permission> Permissions { get; set; }
+        public DbSet<RolePermission> RolePermissions { get; set; }
+        public DbSet<UserPermission> UserPermissions { get; set; }
+
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
             base.OnModelCreating(modelBuilder);
@@ -62,6 +67,26 @@ namespace ISPSystem.Data
 
             // CashBoxes
             modelBuilder.Entity<CashBox>().HasIndex(c => c.Code).IsUnique();
+
+            modelBuilder.Entity<Permission>().HasIndex(p => p.Code).IsUnique();
+            modelBuilder.Entity<RolePermission>().HasIndex(rp => new { rp.Role, rp.PermissionId }).IsUnique();
+            modelBuilder.Entity<UserPermission>().HasIndex(up => new { up.UserId, up.PermissionId }).IsUnique();
+            modelBuilder.Entity<UserPermission>()
+                .HasOne(up => up.User)
+                .WithMany()
+                .HasForeignKey(up => up.UserId)
+                .OnDelete(DeleteBehavior.Cascade);
+            modelBuilder.Entity<UserPermission>()
+                .HasOne(up => up.Permission)
+                .WithMany(p => p.UserPermissions)
+                .HasForeignKey(up => up.PermissionId)
+                .OnDelete(DeleteBehavior.Cascade);
+            modelBuilder.Entity<RolePermission>()
+                .HasOne(rp => rp.Permission)
+                .WithMany(p => p.RolePermissions)
+                .HasForeignKey(rp => rp.PermissionId)
+                .OnDelete(DeleteBehavior.Cascade);
+
             modelBuilder.Entity<CashBox>().Property(c => c.Balance).HasPrecision(18, 2);
             modelBuilder.Entity<CashBox>()
                 .HasOne(c => c.Account)

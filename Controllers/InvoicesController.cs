@@ -1,4 +1,4 @@
-﻿using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using ISPSystem.Data;
@@ -16,7 +16,7 @@ namespace ISPSystem.backend.Controllers
 {
     [ApiController]
     [Route("api/invoices")]
-    [Authorize] // 🔐 تأمين الكنترولر بالكامل لحماية بيانات الفواتير
+    [Authorize]
     public class InvoicesController : ControllerBase
     {
         private readonly InvoiceService _invoiceService;
@@ -30,7 +30,15 @@ namespace ISPSystem.backend.Controllers
             _context = context;
         }
 
-        // 🆔 جلب فاتورة محددة بواسطة المعرف
+        private int? UserId
+        {
+            get
+            {
+                var v = User.FindFirstValue(ClaimTypes.NameIdentifier);
+                return int.TryParse(v, out var id) ? id : null;
+            }
+        }
+
         [HttpGet("{id}")]
         public async Task<IActionResult> GetInvoiceById(int id)
         {
@@ -38,14 +46,32 @@ namespace ISPSystem.backend.Controllers
             if (invoice == null)
                 return NotFound(ApiResponse<string>.Fail("الفاتورة المطلوبة غير موجودة"));
 
-            return Ok(ApiResponse<Invoice>.Ok(invoice));
+            // تفاصيل الصندوق عبر الدفعات
+            var payments = await _context.Payments
+                .Include(p => p.CashBox)
+                .Where(p => p.InvoiceId == id)
+                .Select(p => new
+                {
+                    p.Id,
+                    p.Amount,
+                    p.Date,
+                    p.CashBoxId,
+                    CashBoxName = p.CashBox != null ? p.CashBox.Name : null,
+                    CashBoxCode = p.CashBox != null ? p.CashBox.Code : null
+                })
+                .ToListAsync();
+
+            return Ok(ApiResponse<object>.Ok(new
+            {
+                invoice,
+                payments,
+                defaultCashBox = "صندوق التفعيلات (ACT)"
+            }));
         }
 
-        // 📄 توليد وتحميل ملف PDF للفاتورة بضربة قاعدة بيانات واحدة ومحسنة
         [HttpGet("{id}/pdf")]
         public async Task<IActionResult> GetInvoicePdf(int id)
         {
-            // ⚡ تحسين الأداء: جلب الفاتورة متضمنة العميل والاشتراك والباقة بطلب مجمع واحد
             var invoice = await _context.Invoices
                 .Include(i => i.Client)
                 .Include(i => i.Subscription)
@@ -58,22 +84,21 @@ namespace ISPSystem.backend.Controllers
             if (invoice.Client == null || invoice.Subscription == null || invoice.Subscription.Plan == null)
                 return BadRequest(ApiResponse<string>.Fail("بيانات الفاتورة أو العميل المرتبط بها غير مكتملة في النظام"));
 
-            // توليد ملف الـ PDF عبر الخدمة المخصصة
             var pdf = _pdfService.GenerateInvoicePdf(invoice, invoice.Client, invoice.Subscription, invoice.Subscription.Plan);
-
             return File(pdf, "application/pdf", $"Invoice_{invoice.InvoiceNumber}.pdf");
         }
 
-        // 📋 جلب قائمة الفواتير كاملة (للإدارة والدعم الفني)
+        /// <summary>
+        /// قائمة فواتير الاشتراك مع ربط صندوق التفعيلات
+        /// </summary>
         [HttpGet]
-        [Authorize(Roles = "Admin,Accountant,Support")] // تقييد الوصول للموظفين فقط
+        [Authorize(Roles = "Admin,Accountant,Support")]
         public async Task<IActionResult> GetAll()
         {
-            var invoices = await _invoiceService.GetAll();
-            return Ok(ApiResponse<IEnumerable<Invoice>>.Ok(invoices));
+            var invoices = await _invoiceService.GetAllDetailed();
+            return Ok(ApiResponse<object>.Ok(invoices));
         }
 
-        // ➕ إنشاء فاتورة جديدة يدويًا
         [HttpPost]
         [Authorize(Roles = "Admin,Accountant")]
         public async Task<IActionResult> Create([FromBody] CreateInvoiceDto dto)
@@ -85,43 +110,34 @@ namespace ISPSystem.backend.Controllers
             return Ok(ApiResponse<Invoice>.Ok(invoice));
         }
 
-        // 💳 تحويل حالة الفاتورة إلى "مدفوعة" عند السداد
+        /// <summary>
+        /// سداد فاتورة اشتراك → صندوق التفعيلات
+        /// </summary>
         [HttpPut("{id}/pay")]
         [Authorize(Roles = "Admin,Accountant")]
         public async Task<IActionResult> MarkAsPaid(int id)
         {
-            var invoice = await _context.Invoices.FindAsync(id);
-            if (invoice == null)
-                return NotFound(ApiResponse<string>.Fail("الفاتورة المطلوبة غير موجودة"));
-
-            // تحديث الحقول المالية وحالة السداد
-            invoice.IsPaid = true;
-            invoice.PaidAt = DateTime.Now;
-            invoice.Status = "Paid";
-
-            await _context.SaveChangesAsync();
-
-            // 💡 يفضل مستقبلاً نقل هذا المنطق إلى _invoiceService.MarkAsPaid(id) لتسجيل الـ Audit Log المالي تلقائياً
-
-            return Ok(ApiResponse<Invoice>.Ok(invoice));
+            try
+            {
+                var result = await _invoiceService.MarkAsPaid(id, UserId);
+                return Ok(ApiResponse<object>.Ok(result));
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(ApiResponse<string>.Fail(ex.Message));
+            }
         }
 
-        // 👥 جلب فواتير العميل الحالي السجل الخاص به
         [HttpGet("client")]
         public async Task<IActionResult> GetClientInvoices()
         {
-            // 🔑 استخراج الـ ClientId الحقيقي المشفر داخل توكن الـ JWT الخاص بالعميل المسجل
             var userIdClaim = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
-
             if (string.IsNullOrEmpty(userIdClaim) || !int.TryParse(userIdClaim, out int clientId))
-            {
-                // في حال عدم توفر التوكن بعد في مرحلة التجريب، نترك المعرف الافتراضي 1 كخيار احتياطي برمجياً
                 clientId = 1;
-            }
 
             var invoices = await _context.Invoices
                 .Where(i => i.ClientId == clientId)
-                .OrderByDescending(i => i.Date) // عرض الفواتير الأحدث للعميل أولاً
+                .OrderByDescending(i => i.Date)
                 .ToListAsync();
 
             return Ok(ApiResponse<List<Invoice>>.Ok(invoices));

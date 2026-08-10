@@ -16,14 +16,16 @@ namespace ISPSystem.Services
         private readonly AuditService _audit;
         private readonly RadiusService _radius;
         private readonly MikroTikService _mikroTik;
+        private readonly PermissionService _permissions;
 
-        public UserService(AppDbContext context, PasswordService password, AuditService audit, RadiusService radius, MikroTikService mikroTik)
+        public UserService(AppDbContext context, PasswordService password, AuditService audit, RadiusService radius, MikroTikService mikroTik, PermissionService permissions)
         {
             _context = context;
             _password = password;
             _audit = audit;
             _radius = radius;
             _mikroTik = mikroTik;
+            _permissions = permissions;
         }
 
         // ============= طرق الموظفين (Users) =============
@@ -104,10 +106,29 @@ namespace ISPSystem.Services
             user.FullName = dto.FullName;
             user.Phone = dto.Phone;
             user.Email = dto.Email;
-            user.Role = dto.Role;
+            if (!string.IsNullOrWhiteSpace(dto.Role))
+                user.Role = dto.Role;
+            if (!string.IsNullOrWhiteSpace(dto.Status))
+                user.Status = dto.Status;
+            if (!string.IsNullOrWhiteSpace(dto.Password))
+                user.Password = _password.Hash(dto.Password);
 
             await _context.SaveChangesAsync();
             await _audit.Log("Update", "User", user.Id);
+
+            // تخصيص صلاحيات إن أُرسلت
+            if (dto.Permissions != null)
+            {
+                await _permissions.SetUserPermissionsAsync(id, dto.Permissions.Select(p => new UserPermissionItem
+                {
+                    Code = p.Code,
+                    IsGranted = p.IsGranted
+                }));
+            }
+            else
+            {
+                _permissions.InvalidateUser(id);
+            }
 
             return user;
         }
@@ -205,7 +226,8 @@ namespace ISPSystem.Services
 
             if (dto.FreeSubscription)
             {
-                durationDays = dto.FreeDays > 0 ? dto.FreeDays : 30;
+                // أول إنشاء: يوم واحد فقط حتى التجديد (حتى لو اشتراك مجاني)
+                durationDays = 1;
                 price = 0;
                 speed = string.IsNullOrWhiteSpace(dto.FreeSpeed) ? "2M/2M" : dto.FreeSpeed;
                 if (dto.PlanId.HasValue && dto.PlanId.Value > 0)
@@ -245,30 +267,23 @@ namespace ISPSystem.Services
                 plan = await _context.Plans.FindAsync(dto.PlanId.Value);
                 if (plan == null)
                     throw new Exception("الخطة غير موجودة");
-                durationDays = plan.DurationDays;
-                price = plan.Price;
+                // عند الإنشاء لأول مرة: يوم تجريبي واحد فقط حتى يتم التجديد
+                durationDays = 1;
+                price = 0; // لا تحصيل عند الإنشاء — التحصيل عند التجديد
                 speed = plan.Speed ?? "1M/1M";
             }
 
-            var existingCount = await _context.Clients
-                .Where(c => c.NationalId == dto.NationalId)
-                .CountAsync();
-
-            var sequence = existingCount + 1;
-            // معرف العميل / اسم المستخدم: {nationalId}-{seq}@sham.net أو ما يُرسل
-            var username = !string.IsNullOrWhiteSpace(dto.Username)
-                ? dto.Username.Trim()
-                : $"{dto.NationalId}-{sequence}@sham.net";
-
-            if (await _context.Clients.AnyAsync(c => c.Username == username))
-                throw new Exception("اسم المستخدم موجود مسبقاً");
+            // اسم المستخدم: {nationalId}-{N}@sham.net حيث N أكبر رقم موجود + 1
+            var username = await GenerateUniqueUsernameAsync(dto.NationalId, dto.Username);
 
             var plainPassword = !string.IsNullOrWhiteSpace(dto.Password)
                 ? dto.Password
                 : RandomPasswordService.GeneratePassword(6);
             var hashedPassword = _password.Hash(plainPassword);
 
-            var endDate = DateTime.Now.AddDays(durationDays);
+            // نهاية الاشتراك دائماً الساعة 12:00 ظهراً
+            // عميل جديد: يوم واحد (حتى ظهر الغد) حتى يتم التجديد
+            var endDate = DateTime.Now.Date.AddDays(Math.Max(1, durationDays)).AddHours(12);
 
             if (string.IsNullOrWhiteSpace(dto.NationalId) || dto.NationalId.Length != 11 || !dto.NationalId.All(char.IsDigit))
                 throw new Exception("الرقم الوطني يجب أن يكون 11 خانة رقمية");
@@ -279,6 +294,24 @@ namespace ISPSystem.Services
             var fullName = !string.IsNullOrWhiteSpace(dto.FullName)
                 ? dto.FullName.Trim()
                 : $"{dto.FirstName} {dto.LastName}".Trim();
+
+            // رقم عقد فريد تلقائياً إن لم يُرسل
+            var contractNumber = !string.IsNullOrWhiteSpace(dto.ContractNumber)
+                ? dto.ContractNumber.Trim()
+                : await GenerateUniqueContractNumberAsync();
+
+            // ربط السيرفر: من الـ DTO أو تلقائياً حسب المدينة/المنطقة
+            int? serverId = dto.MikroTikServerId;
+            if (!serverId.HasValue || serverId.Value <= 0)
+            {
+                serverId = await ResolveServerIdByCityAsync(dto.City);
+            }
+            else
+            {
+                var exists = await _context.MikroTikDevices.AnyAsync(d => d.Id == serverId.Value);
+                if (!exists)
+                    throw new Exception("سيرفر MikroTik المحدد غير موجود");
+            }
 
             var client = new Client
             {
@@ -306,7 +339,7 @@ namespace ISPSystem.Services
                 Area = dto.Area,
                 Street = dto.Street,
                 Apartment = dto.Apartment,
-                ContractNumber = dto.ContractNumber,
+                ContractNumber = contractNumber,
                 Notes = dto.Notes,
                 SecondaryPhone = dto.SecondaryPhone,
                 PaymentStatus = dto.PaymentStatus ?? "Pending",
@@ -315,7 +348,8 @@ namespace ISPSystem.Services
                 ContractFrontImage = dto.ContractFrontImage,
                 ContractBackImage = dto.ContractBackImage,
                 HasFreeSubscription = dto.FreeSubscription,
-                FreeSpeed = dto.FreeSubscription ? (dto.FreeSpeed ?? "2M/2M") : null
+                FreeSpeed = dto.FreeSubscription ? (dto.FreeSpeed ?? "2M/2M") : null,
+                MikroTikServerId = serverId
             };
 
             using var transaction = await _context.Database.BeginTransactionAsync();
@@ -485,6 +519,135 @@ namespace ISPSystem.Services
             var month = DateTime.Now.Month;
             var count = _context.Invoices.Count() + 1;
             return $"INV-{year}{month:D2}-{count:D6}";
+        }
+
+        /// <summary>
+        /// يولّد اسم مستخدم فريداً بالشكل: {nationalId}-{N}@sham.net
+        /// حيث N هو أكبر رقم مستخدم لنفس الرقم الوطني + 1
+        /// </summary>
+        public async Task<string> GenerateUniqueUsernameAsync(string nationalId, string preferredUsername = null)
+        {
+            if (string.IsNullOrWhiteSpace(nationalId) || nationalId.Length != 11)
+                throw new Exception("الرقم الوطني غير صالح");
+
+            // إن وُجد اسم مفضّل وغير مستخدم — استخدمه
+            if (!string.IsNullOrWhiteSpace(preferredUsername))
+            {
+                var preferred = preferredUsername.Trim();
+                if (!await _context.Clients.AnyAsync(c => c.Username == preferred))
+                    return preferred;
+            }
+
+            // استخراج أقصى رقم تسلسلي من أسماء المستخدمين المرتبطة بنفس الرقم الوطني
+            var existingUsernames = await _context.Clients
+                .Where(c => c.NationalId == nationalId || c.Username.StartsWith(nationalId + "-"))
+                .Select(c => c.Username)
+                .ToListAsync();
+
+            int maxSeq = 0;
+            var prefix = nationalId + "-";
+            foreach (var u in existingUsernames)
+            {
+                if (string.IsNullOrEmpty(u)) continue;
+                // صيغة متوقعة: 03310011711-2@sham.net
+                var at = u.IndexOf('@');
+                var core = at > 0 ? u.Substring(0, at) : u;
+                if (!core.StartsWith(prefix)) continue;
+                var seqPart = core.Substring(prefix.Length);
+                if (int.TryParse(seqPart, out var n) && n > maxSeq)
+                    maxSeq = n;
+            }
+
+            var sequence = maxSeq + 1;
+            var username = $"{nationalId}-{sequence}@sham.net";
+
+            // ضمان عدم التصادم (نادر)
+            while (await _context.Clients.AnyAsync(c => c.Username == username))
+            {
+                sequence++;
+                username = $"{nationalId}-{sequence}@sham.net";
+            }
+
+            return username;
+        }
+
+        /// <summary>
+        /// رقم عقد فريد: 6 خانات رقمية فقط (مثال: 000001)
+        /// </summary>
+        public async Task<string> GenerateUniqueContractNumberAsync()
+        {
+            var existing = await _context.Clients
+                .Where(c => c.ContractNumber != null && c.ContractNumber != "")
+                .Select(c => c.ContractNumber)
+                .ToListAsync();
+
+            int max = 0;
+            foreach (var cn in existing)
+            {
+                if (int.TryParse(cn, out var n) && n > max)
+                    max = n;
+            }
+
+            int next = max + 1;
+            if (next < 1) next = 1;
+            if (next > 999999)
+                throw new Exception("تم استنفاد أرقام العقود (الحد الأقصى 999999)");
+
+            string contract;
+            do
+            {
+                contract = next.ToString("D6"); // 000001, 000002, ...
+                next++;
+            } while (await _context.Clients.AnyAsync(c => c.ContractNumber == contract));
+
+            return contract;
+        }
+
+        /// <summary>للواجهة: الحصول على اسم المستخدم التالي ورقم العقد التالي</summary>
+        public async Task<object> GetNextClientIdentifiers(string nationalId)
+        {
+            if (string.IsNullOrWhiteSpace(nationalId) || nationalId.Length != 11 || !nationalId.All(char.IsDigit))
+                throw new Exception("الرقم الوطني يجب أن يكون 11 خانة رقمية");
+
+            var username = await GenerateUniqueUsernameAsync(nationalId);
+            var contractNumber = await GenerateUniqueContractNumberAsync();
+            return new { username, contractNumber };
+        }
+
+        /// <summary>
+        /// إيجاد سيرفر MikroTik حسب المدينة/المنطقة (Region).
+        /// الأولوية: مفعّل + أونلاين → مفعّل → أي سيرفر في المنطقة.
+        /// </summary>
+        public async Task<int?> ResolveServerIdByCityAsync(string city)
+        {
+            if (string.IsNullOrWhiteSpace(city))
+                return null;
+
+            var region = city.Trim();
+            var candidates = await _context.MikroTikDevices
+                .Where(d => d.Region != null && d.Region == region)
+                .ToListAsync();
+
+            if (candidates.Count == 0)
+            {
+                // مطابقة غير حساسة لحالة الأحرف / مسافات
+                candidates = await _context.MikroTikDevices
+                    .Where(d => d.Region != null)
+                    .ToListAsync();
+                candidates = candidates
+                    .Where(d => string.Equals(d.Region.Trim(), region, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+            }
+
+            if (candidates.Count == 0)
+                return null;
+
+            var preferred =
+                candidates.FirstOrDefault(d => d.IsEnabled && (d.IsOnline || d.Status == "Online"))
+                ?? candidates.FirstOrDefault(d => d.IsEnabled)
+                ?? candidates.FirstOrDefault();
+
+            return preferred?.Id;
         }
     }
 }

@@ -27,6 +27,7 @@ namespace ISPSystem.Controllers
         private readonly SubscriptionService _subscriptionService;
         private readonly PasswordService _password;
         private readonly MikroTikService _mikroTik;
+        private readonly CashBoxService _cashBoxes;
 
         public ClientsController(
             UserService userService,
@@ -35,7 +36,8 @@ namespace ISPSystem.Controllers
             RadiusService radius,
             SubscriptionService subscriptionService,
             PasswordService password,
-            MikroTikService mikroTik)
+            MikroTikService mikroTik,
+            CashBoxService cashBoxes)
         {
             _userService = userService;
             _context = context;
@@ -44,6 +46,7 @@ namespace ISPSystem.Controllers
             _subscriptionService = subscriptionService;
             _password = password;
             _mikroTik = mikroTik;
+            _cashBoxes = cashBoxes;
         }
 
         // 📋 الحصول على جميع العملاء
@@ -186,6 +189,7 @@ namespace ISPSystem.Controllers
                     ActiveSubscription = sub == null ? null : new
                     {
                         sub.Id,
+                        PlanId = sub.PlanId,
                         PlanName = sub.Plan?.Name ?? "باقة غير معروفة",
                         PlanSpeed = sub.Plan?.Speed,
                         sub.StartDate,
@@ -304,6 +308,25 @@ namespace ISPSystem.Controllers
             }));
         }
 
+        /// <summary>
+        /// الحصول على اسم المستخدم التالي ورقم العقد التالي لرقم وطني معيّن
+        /// مثال: 03310011711 → 03310011711-2@sham.net إن وُجد -1 مسبقاً
+        /// </summary>
+        [HttpGet("next-identifiers")]
+        [Authorize(Roles = "Admin,Employee")]
+        public async Task<IActionResult> GetNextIdentifiers([FromQuery] string nationalId)
+        {
+            try
+            {
+                var data = await _userService.GetNextClientIdentifiers(nationalId);
+                return Ok(ApiResponse<object>.Ok(data));
+            }
+            catch (Exception ex)
+            {
+                return BadRequest(ApiResponse<string>.Fail(ex.Message));
+            }
+        }
+
         // ➕ إضافة عميل جديد
         [HttpPost]
         [Authorize(Roles = "Admin,Employee")]
@@ -337,8 +360,11 @@ namespace ISPSystem.Controllers
                         client.MacAddress,
                         client.IpAddress,
                         client.NationalId,
+                        client.ContractNumber,
+                        client.City,
+                        client.MikroTikServerId,
                         client.Status,
-                        Password = client.Password // تُعرض مرة واحدة فقط
+                        Password = client.Password // تُعرض مرة واحدة فقط (نص عادي)
                     },
                     message = "تم إنشاء العميل بنجاح وإضافته إلى RADIUS"
                 }));
@@ -480,10 +506,10 @@ namespace ISPSystem.Controllers
             }));
         }
 
-        // 🔄 تجديد الاشتراك
+        // 🔄 تجديد الاشتراك — اختيار باقة (سرعة) + إضافة المبلغ لصندوق التفعيل
         [HttpPost("{id}/renew")]
-        [Authorize(Roles = "Admin,Employee,Support")]
-        public async Task<IActionResult> Renew(int id)
+        [HasPermission("clients.renew")]
+        public async Task<IActionResult> Renew(int id, [FromBody] RenewClientDto dto = null)
         {
             var client = await _context.Clients.FindAsync(id);
             if (client == null)
@@ -491,13 +517,14 @@ namespace ISPSystem.Controllers
 
             try
             {
-                var sub = await _subscriptionService.Renew(id);
+                int? planId = dto?.PlanId;
+                var sub = await _subscriptionService.Renew(id, planId);
 
                 // تحديث تاريخ الانتهاء في RADIUS + تفعيل المستخدم
                 await _radius.UpdateExpiration(client.Username, sub.EndDate);
                 await _radius.EnableUser(client.Username);
 
-                // إن تغيّرت سرعة الباقة — حدّث RADIUS وافصل الجلسة
+                // سرعة الباقة المختارة
                 if (sub.Plan != null && !string.IsNullOrWhiteSpace(sub.Plan.Speed))
                 {
                     await _radius.UpdateSpeed(client.Username, sub.Plan.Speed);
@@ -505,16 +532,77 @@ namespace ISPSystem.Controllers
                 try { await _mikroTik.KickActiveUser(client.Username); }
                 catch { /* لا جلسة */ }
 
+                // فاتورة + دفعة + صندوق التفعيلات (ACT)
+                decimal amount = sub.Plan?.Price ?? 0;
+                Payment payment = null;
+                if (amount > 0)
+                {
+                    var invoice = new Invoice
+                    {
+                        InvoiceNumber = $"INV-RNW-{DateTime.Now:yyyyMMddHHmmss}-{client.Id}",
+                        ClientId = client.Id,
+                        SubscriptionId = sub.Id,
+                        SubTotal = amount,
+                        Tax = 0,
+                        Discount = 0,
+                        Total = amount,
+                        Date = DateTime.Now,
+                        DueDate = DateTime.Now,
+                        IsPaid = true,
+                        PaidAt = DateTime.Now,
+                        Status = "Paid"
+                    };
+                    _context.Invoices.Add(invoice);
+                    await _context.SaveChangesAsync();
+
+                    var actBox = await _context.CashBoxes.FirstOrDefaultAsync(c => c.Code == "ACT" && c.IsActive);
+                    payment = new Payment
+                    {
+                        ClientId = client.Id,
+                        SubscriptionId = sub.Id,
+                        InvoiceId = invoice.Id,
+                        Amount = amount,
+                        Date = DateTime.Now,
+                        PaymentMethod = "Cash",
+                        Status = "Completed",
+                        Notes = $"تجديد اشتراك — {sub.Plan?.Name} — {sub.Plan?.Speed}",
+                        CashBoxId = actBox?.Id
+                    };
+                    _context.Payments.Add(payment);
+                    await _context.SaveChangesAsync();
+
+                    if (actBox != null)
+                    {
+                        var revenueAccount = await _context.Accounts
+                            .FirstOrDefaultAsync(a => a.Code == "4-1-2" && a.IsActive);
+                        await _cashBoxes.PostReference(
+                            actBox.Id,
+                            "In",
+                            amount,
+                            revenueAccount?.Id ?? actBox.AccountId,
+                            "Renewal",
+                            sub.Id,
+                            $"تجديد اشتراك — {client.FullName ?? client.Username} — {sub.Plan?.Name} ({sub.Plan?.Speed})",
+                            null);
+                    }
+                }
+
                 client.Status = "Active";
+                client.PaymentStatus = amount > 0 ? "Paid" : client.PaymentStatus;
                 await _context.SaveChangesAsync();
                 await _audit.Log("Renew", "Client", id);
 
                 return Ok(ApiResponse<object>.Ok(new
                 {
-                    message = "تم تجديد الاشتراك بنجاح",
+                    message = "تم تجديد الاشتراك بنجاح وإضافته لصندوق التفعيل",
                     newEndDate = sub.EndDate,
                     daysAdded = sub.Plan?.DurationDays,
-                    planSpeed = sub.Plan?.Speed
+                    planId = sub.PlanId,
+                    planName = sub.Plan?.Name,
+                    planSpeed = sub.Plan?.Speed,
+                    amount = amount,
+                    paymentId = payment?.Id,
+                    cashBox = "صندوق التفعيلات"
                 }));
             }
             catch (Exception ex)

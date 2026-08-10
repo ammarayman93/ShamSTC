@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Security.Claims;
 using System.Threading.Tasks;
 using ISPSystem.DTOs;
@@ -30,9 +30,9 @@ namespace ISPSystem.backend.Controllers
             }
         }
 
-        /// <summary>تسجيل دفعة / تحصيل اشتراك → صندوق التفعيلات</summary>
+        /// <summary>تسجيل دفعة / تحصيل اشتراك → صندوق التفعيلات (+ فاتورة مرتبطة)</summary>
         [HttpPost]
-        [Authorize(Roles = "Admin,Accountant")]
+        [Authorize(Roles = "Admin,Accountant,Employee,Support")]
         public async Task<IActionResult> Pay([FromBody] CreatePaymentDto dto)
         {
             if (dto == null)
@@ -40,19 +40,19 @@ namespace ISPSystem.backend.Controllers
 
             try
             {
-                // دعم التوافق: إن وُجد ClientId استخدمه
-                var clientId = dto.ClientId;
-                if (clientId <= 0)
+                if (dto.ClientId <= 0)
                     return BadRequest(ApiResponse<string>.Fail("يجب تحديد ClientId"));
 
                 var payment = await _service.Pay(
-                    clientId,
+                    dto.ClientId,
                     dto.Amount,
                     dto.CashBoxId,
                     dto.Notes,
-                    UserId);
+                    UserId,
+                    dto.InvoiceId,
+                    extendSubscription: true);
 
-                return Ok(ApiResponse<object>.Ok(payment, "تم تسجيل الدفعة"));
+                return Ok(ApiResponse<object>.Ok(payment, "تم تسجيل الدفعة في صندوق التفعيلات"));
             }
             catch (Exception ex)
             {

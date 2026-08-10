@@ -12,7 +12,8 @@ namespace ISPSystem.backend.Controllers
 {
     [ApiController]
     [Route("api/users")]
-    [Authorize(Roles = "Admin")] // 🔐 حماية كاملة: إدارة حسابات الموظفين وصلاحياتهم محصورة بالـ Admin فقط
+    [Authorize]
+    // الصلاحيات التفصيلية عبر HasPermission — Admin يتجاوزها دائماً
     public class UsersController : ControllerBase
     {
         private readonly UserService _service;
@@ -24,6 +25,7 @@ namespace ISPSystem.backend.Controllers
         }
         // 👥 عرض كل المستخدمين والموظفين في النظام مع دعم الفلترة (Async)
         [HttpGet]
+        [HasPermission("users.view", "users.manage")]
         public async Task<IActionResult> GetAll([FromQuery] UserQuery query)
         {
             try
@@ -55,6 +57,7 @@ namespace ISPSystem.backend.Controllers
 
         // ➕ إضافة مستخدم أو موظف جديد إلى النظام (الدعم الفني، المبيعات، المحاسبة)
         [HttpPost]
+        [HasPermission("users.manage")]
         public async Task<IActionResult> Create([FromBody] CreateUserDto dto)
         {
             if (dto == null)
@@ -73,6 +76,7 @@ namespace ISPSystem.backend.Controllers
 
         // 🔄 تعديل بيانات موظف قائم (تحديث الصلاحيات، الاسم، أو حالة الحساب)
         [HttpPut("{id}")]
+        [HasPermission("users.manage")]
         public async Task<IActionResult> Update(int id, [FromBody] UpdateUserDto dto)
         {
             if (dto == null)
@@ -87,6 +91,7 @@ namespace ISPSystem.backend.Controllers
 
         // ❌ حذف حساب موظف من النظام
         [HttpDelete("{id}")]
+        [HasPermission("users.manage")]
         public async Task<IActionResult> Delete(int id)
         {
             var result = await _service.Delete(id);

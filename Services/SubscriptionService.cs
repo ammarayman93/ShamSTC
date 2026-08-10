@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
@@ -18,6 +18,23 @@ namespace ISPSystem.Services
             _context = context;
         }
 
+        /// <summary>
+        /// نهاية الاشتراك دائماً الساعة 12:00 ظهراً في يوم الانتهاء
+        /// </summary>
+        public static DateTime EndAtNoon(DateTime from, int days)
+        {
+            if (days < 1) days = 1;
+            // من تاريخ اليوم + الأيام، الساعة 12 ظهراً
+            return from.Date.AddDays(days).AddHours(12);
+        }
+
+        public static DateTime ExtendEndAtNoon(DateTime currentEnd, int days)
+        {
+            if (days < 1) days = 1;
+            var baseDate = currentEnd > DateTime.Now ? currentEnd.Date : DateTime.Now.Date;
+            return baseDate.AddDays(days).AddHours(12);
+        }
+
         // إنشاء اشتراك جديد
         public async Task<Subscription> Subscribe(int clientId, int planId, int? customDays = null)
         {
@@ -30,13 +47,14 @@ namespace ISPSystem.Services
                 throw new Exception("Plan not found");
 
             var days = customDays ?? plan.DurationDays;
+            if (days < 1) days = 1;
 
             var sub = new Subscription
             {
                 ClientId = clientId,
                 PlanId = planId,
                 StartDate = DateTime.Now,
-                EndDate = DateTime.Now.AddDays(days),
+                EndDate = EndAtNoon(DateTime.Now, days),
                 IsActive = true,
                 Status = "Active",
                 PaidAmount = plan.Price
@@ -45,6 +63,7 @@ namespace ISPSystem.Services
             _context.Subscriptions.Add(sub);
             await _context.SaveChangesAsync();
 
+            await _context.Entry(sub).Reference(s => s.Plan).LoadAsync();
             return sub;
         }
 
@@ -56,7 +75,10 @@ namespace ISPSystem.Services
                 .ToListAsync();
         }
 
-        // تمديد اشتراك (مع إمكانية تغيير الباقة/السرعة)
+        /// <summary>
+        /// تجديد الاشتراك مع إمكانية اختيار باقة (سرعة) جديدة.
+        /// نهاية الاشتراك تُضبط على الساعة 12:00 ظهراً.
+        /// </summary>
         public async Task<Subscription> Renew(int clientId, int? newPlanId = null)
         {
             var sub = await _context.Subscriptions
@@ -66,7 +88,13 @@ namespace ISPSystem.Services
                 .FirstOrDefaultAsync();
 
             if (sub == null)
-                throw new Exception("Subscription not found");
+            {
+                // لا يوجد اشتراك سابق — إنشاء واحد جديد إن وُجدت باقة
+                if (!newPlanId.HasValue || newPlanId.Value <= 0)
+                    throw new Exception("لا يوجد اشتراك سابق — يجب اختيار باقة للتفعيل");
+
+                return await Subscribe(clientId, newPlanId.Value);
+            }
 
             // تغيير الباقة إن طُلب
             if (newPlanId.HasValue && newPlanId.Value > 0 && newPlanId.Value != sub.PlanId)
@@ -79,25 +107,21 @@ namespace ISPSystem.Services
                 sub.Plan = newPlan;
             }
 
-            // إعادة تحميل الخطة بعد التغيير
             if (sub.Plan == null)
                 await _context.Entry(sub).Reference(s => s.Plan).LoadAsync();
 
             var duration = sub.Plan?.DurationDays ?? 30;
+            if (duration < 1) duration = 30;
 
-            sub.EndDate = sub.EndDate > DateTime.Now
-                ? sub.EndDate.AddDays(duration)
-                : DateTime.Now.AddDays(duration);
-
+            sub.EndDate = ExtendEndAtNoon(sub.EndDate, duration);
             sub.IsActive = true;
             sub.Status = "Active";
             sub.RenewedAt = DateTime.Now;
+            if (sub.Plan != null)
+                sub.PaidAmount = sub.Plan.Price;
 
             await _context.SaveChangesAsync();
-
-            // تأكد من تحميل الخطة للرد
             await _context.Entry(sub).Reference(s => s.Plan).LoadAsync();
-
             return sub;
         }
 
@@ -116,9 +140,9 @@ namespace ISPSystem.Services
                 return null;
 
             sub.PlanId = dto.PlanId;
-            sub.ClientId = dto.UserId;  // UserId في الـ DTO هو ClientId
+            sub.ClientId = dto.UserId;
             sub.StartDate = DateTime.Now;
-            sub.EndDate = DateTime.Now.AddDays(dto.Days);
+            sub.EndDate = EndAtNoon(DateTime.Now, dto.Days > 0 ? dto.Days : 30);
             sub.IsActive = true;
 
             await _context.SaveChangesAsync();

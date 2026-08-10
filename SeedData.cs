@@ -101,6 +101,7 @@ namespace ISPSystem
 
             // ========== شجرة الحسابات + الصناديق ==========
             AccountingSeed.Seed(context);
+            PermissionSeed.Seed(context);
 
             context.SaveChanges();
         }

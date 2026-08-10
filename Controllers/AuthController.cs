@@ -6,6 +6,8 @@
     using ISPSystem.Helpers;
     using System.Threading.Tasks;
     using System;
+using System.Linq;
+using System.Collections.Generic;
 using ISPSystem.Models;
 using Microsoft.AspNetCore.Http;
 
@@ -18,12 +20,14 @@ using Microsoft.AspNetCore.Http;
             private readonly AppDbContext _context;
             private readonly JwtService _jwt;
             private readonly PasswordService _password;
+            private readonly PermissionService _permissions;
 
-            public AuthController(AppDbContext context, JwtService jwt, PasswordService password)
+            public AuthController(AppDbContext context, JwtService jwt, PasswordService password, PermissionService permissions)
             {
                 _context = context;
                 _jwt = jwt;
                 _password = password;
+                _permissions = permissions;
             }
 
             // 🏢 تسجيل دخول الموظفين (User)
@@ -49,6 +53,19 @@ using Microsoft.AspNetCore.Http;
 
                 var token = _jwt.GenerateToken(user);
 
+                // الصلاحيات اختيارية — لا تمنع تسجيل الدخول إن لم تُنشأ الجداول بعد
+                var permCodes = new List<string>();
+                try
+                {
+                    var set = await _permissions.GetEffectivePermissionsAsync(user.Id);
+                    permCodes = set.OrderBy(c => c).ToList();
+                }
+                catch (Exception perEx)
+                {
+                    Console.WriteLine($"[Login] permissions skipped: {perEx.Message}");
+                    // اترك القائمة فارغة — الفرونت يعامل Admin / القائمة الفارغة بأمان
+                }
+
                 // حفظ الـ Token داخل الكوكيز لأمان الموظفين
                 Response.Cookies.Append("token", token, new CookieOptions
                 {
@@ -68,7 +85,9 @@ using Microsoft.AspNetCore.Http;
                         username = user.Username,
                         role = user.Role ?? "Admin",
                         fullName = user.FullName,
-                        type = "user"
+                        type = "user",
+                        isAdmin = PermissionService.IsAdminRole(user.Role),
+                        permissions = permCodes
                     }
                 }));
             }

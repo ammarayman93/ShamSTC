@@ -61,6 +61,8 @@ type MenuLeaf = {
     path: string;
     label: string;
     icon: React.ReactNode;
+    /** إن وُجدت يُعرض العنصر فقط إن امتلك المستخدم أحدها */
+    permissions?: string[];
 };
 
 type MenuGroup = {
@@ -68,10 +70,11 @@ type MenuGroup = {
     label: string;
     icon: React.ReactNode;
     children: MenuLeaf[];
+    permissions?: string[];
 };
 
 type MenuEntry =
-    | { type: 'item'; path: string; label: string; icon: React.ReactNode }
+    | { type: 'item'; path: string; label: string; icon: React.ReactNode; permissions?: string[] }
     | { type: 'group'; group: MenuGroup };
 
 const menuStructure: MenuEntry[] = [
@@ -80,6 +83,7 @@ const menuStructure: MenuEntry[] = [
         path: '/dashboard',
         label: 'الصفحة الرئيسية',
         icon: <DashboardIcon />,
+        permissions: ['dashboard.view'],
     },
     {
         type: 'group',
@@ -88,10 +92,10 @@ const menuStructure: MenuEntry[] = [
             label: 'الإنترنت',
             icon: <WifiIcon />,
             children: [
-                { path: '/clients', label: 'العملاء', icon: <PeopleIcon /> },
-                { path: '/plans', label: 'الباقات', icon: <ReceiptIcon /> },
-                { path: '/mikrotik-devices', label: 'أجهزة المايكروتيك', icon: <RouterIcon /> },
-                { path: '/invoices', label: 'فواتير الاشتراك', icon: <DescriptionIcon /> },
+                { path: '/clients', label: 'العملاء', icon: <PeopleIcon />, permissions: ['clients.view'] },
+                { path: '/plans', label: 'الباقات', icon: <ReceiptIcon />, permissions: ['plans.view', 'plans.manage'] },
+                { path: '/mikrotik-devices', label: 'أجهزة المايكروتيك', icon: <RouterIcon />, permissions: ['mikrotik.view', 'mikrotik.manage'] },
+                { path: '/invoices', label: 'فواتير الاشتراك', icon: <DescriptionIcon />, permissions: ['invoices.view'] },
             ],
         },
     },
@@ -102,16 +106,16 @@ const menuStructure: MenuEntry[] = [
             label: 'المحاسبة',
             icon: <AccountBalanceIcon />,
             children: [
-                { path: '/financial', label: 'المالية', icon: <MoneyIcon /> },
-                { path: '/accounts', label: 'شجرة الحسابات', icon: <AccountTreeIcon /> },
-                { path: '/cash-boxes', label: 'الصناديق', icon: <AccountBalanceWalletIcon /> },
-                { path: '/cash-flow', label: 'حركة الصناديق', icon: <AccountBalanceIcon /> },
+                { path: '/financial', label: 'المالية', icon: <MoneyIcon />, permissions: ['reports.financial', 'reports.view'] },
+                { path: '/accounts', label: 'شجرة الحسابات', icon: <AccountTreeIcon />, permissions: ['accounts.view', 'accounts.manage'] },
+                { path: '/cash-boxes', label: 'الصناديق', icon: <AccountBalanceWalletIcon />, permissions: ['cashboxes.view', 'cashboxes.manage'] },
+                { path: '/cash-flow', label: 'حركة الصناديق', icon: <AccountBalanceIcon />, permissions: ['cashboxes.view'] },
                 { path: '/materials', label: 'بطاقة المادة', icon: <CategoryIcon /> },
-                { path: '/purchase-invoices', label: 'فواتير المشتريات', icon: <ShoppingCartIcon /> },
-                { path: '/sales-invoices', label: 'فواتير المبيعات', icon: <StorefrontIcon /> },
+                { path: '/purchase-invoices', label: 'فواتير المشتريات', icon: <ShoppingCartIcon />, permissions: ['purchases.view', 'purchases.manage'] },
+                { path: '/sales-invoices', label: 'فواتير المبيعات', icon: <StorefrontIcon />, permissions: ['sales.view', 'sales.manage'] },
                 { path: '/inventory', label: 'المخزون', icon: <InventoryIcon /> },
-                { path: '/purchases', label: 'المشتريات', icon: <ShoppingCartIcon /> },
-                { path: '/sales', label: 'المبيعات', icon: <LocalMallIcon /> },
+                { path: '/purchases', label: 'المشتريات', icon: <ShoppingCartIcon />, permissions: ['purchases.view', 'purchases.manage'] },
+                { path: '/sales', label: 'المبيعات', icon: <LocalMallIcon />, permissions: ['sales.view', 'sales.manage'] },
             ],
         },
     },
@@ -119,12 +123,14 @@ const menuStructure: MenuEntry[] = [
         type: 'item',
         path: '/users',
         label: 'المستخدمين',
+        permissions: ['users.view', 'users.manage'],
         icon: <PeopleIcon />,
     },
     {
         type: 'item',
         path: '/tickets',
         label: 'تذاكر الدعم',
+        permissions: ['tickets.view', 'tickets.manage'],
         icon: <HelpIcon />,
     },
     {
@@ -137,12 +143,14 @@ const menuStructure: MenuEntry[] = [
         type: 'item',
         path: '/reports',
         label: 'التقارير',
+        permissions: ['reports.view', 'reports.financial'],
         icon: <TrendingUpIcon />,
     },
     {
         type: 'item',
         path: '/settings',
         label: 'الإعدادات',
+        permissions: ['settings.manage'],
         icon: <SettingsIcon />,
     },
 ];
@@ -155,7 +163,7 @@ export default function Layout() {
         internet: true,
         accounting: false,
     });
-    const { user, logout } = useAuth();
+    const { user, logout, isAdmin, hasAnyPermission, hasPermission } = useAuth();
     const { isDarkMode, toggleTheme } = useAppTheme();
     const theme = useTheme();
     const navigate = useNavigate();
@@ -174,6 +182,29 @@ export default function Layout() {
     const toggleGroup = (key: string) => {
         setOpenGroups((prev) => ({ ...prev, [key]: !prev[key] }));
     };
+
+    const canSee = (perms?: string[]) => {
+        try {
+            // بدون متطلبات صلاحية → يظهر للجميع المسجّلين
+            if (!perms || perms.length === 0) return true;
+            if (isAdmin || (user?.role || '').toLowerCase() === 'admin') return true;
+            if (typeof hasAnyPermission !== 'function') return false;
+            return hasAnyPermission(...perms);
+        } catch {
+            return false;
+        }
+    };
+
+    const visibleMenu: MenuEntry[] = menuStructure
+        .map((entry) => {
+            if (entry.type === 'item') {
+                return canSee(entry.permissions) ? entry : null;
+            }
+            const children = entry.group.children.filter((c) => canSee(c.permissions));
+            if (children.length === 0) return null;
+            return { type: 'group' as const, group: { ...entry.group, children } };
+        })
+        .filter(Boolean) as MenuEntry[];
 
     const isActive = (path: string) =>
         location.pathname === path || location.pathname.startsWith(path + '/');
@@ -205,7 +236,7 @@ export default function Layout() {
                 </Typography>
             </Toolbar>
             <List sx={{ px: 2, pb: 3 }}>
-                {menuStructure.map((entry) => {
+                {visibleMenu.map((entry) => {
                     if (entry.type === 'item') {
                         const active = isActive(entry.path);
                         return (

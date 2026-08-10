@@ -87,6 +87,7 @@ namespace ISPSystem
             services.AddScoped<MikroTikDeviceService>();
             services.AddScoped<AccountService>();
             services.AddScoped<CashBoxService>();
+            services.AddScoped<PermissionService>();
             services.AddScoped<MaterialService>();
             services.AddScoped<PurchaseInvoiceService>();
             services.AddScoped<SalesInvoiceService>();
