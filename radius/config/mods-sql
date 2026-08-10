@@ -1,0 +1,47 @@
+sql {
+    dialect = "mysql"
+    driver = "rlm_sql_mysql"
+
+    server = "isp_mysql"
+    port = 3306
+
+    login = "root"
+    password = "RootP@ssw0rd2026!"
+
+    radius_db = "isp_system"
+
+    # ===== أسماء الجداول =====
+    acct_table1 = "radacct"
+    acct_table2 = "radacct"
+    postauth_table = "radpostauth"
+    authcheck_table = "radcheck"
+    authreply_table = "radreply"
+    groupcheck_table = "radgroupcheck"
+    groupreply_table = "radgroupreply"
+    usergroup_table = "radusergroup"
+    client_table = "nas"
+
+    # ===== هذا السطر كان ناقص =====
+    group_attribute = "SQL-Group"
+
+    read_groups = yes
+    read_profiles = yes
+    read_clients = no
+    delete_stale_sessions = yes
+
+    sql_user_name = "%{User-Name}"
+
+    $INCLUDE ${modconfdir}/${.:name}/main/${dialect}/queries.conf
+
+    pool {
+        start = 3
+        min = 1
+        max = 16
+        spare = 2
+        uses = 0
+        lifetime = 0
+        idle_timeout = 60
+        retry_delay = 5
+        max_retries = 5
+    }
+}
