@@ -132,10 +132,7 @@ export default function Clients() {
 
     useEffect(() => {
         fetchClients();
-        const interval = setInterval(() => {
-            fetchClients();
-        }, 15000);
-        return () => clearInterval(interval);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [page, rowsPerPage, search]);
 
     const fetchClients = async () => {
