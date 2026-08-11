@@ -1,154 +1,133 @@
 version: "3.9"
 
 services:
-
   mysql:
     image: mysql:8.0
     container_name: isp_mysql
-
     environment:
       MYSQL_ROOT_PASSWORD: RootP@ssw0rd2026!
       MYSQL_DATABASE: isp_system
       MYSQL_USER: isp_user
       MYSQL_PASSWORD: SecureP@ssw0rd2026!
-
     ports:
       - "3309:3306"
-
     volumes:
       - mysql_data:/var/lib/mysql
-
     networks:
       - isp_network
-
     healthcheck:
-      test: ["CMD","mysqladmin","ping","-h","localhost"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
       interval: 10s
       timeout: 5s
       retries: 5
-
     restart: unless-stopped
-
 
   redis:
     image: redis:7-alpine
     container_name: isp_redis
-
     ports:
       - "6379:6379"
-
     volumes:
       - redis_data:/data
-
     networks:
       - isp_network
-
     restart: unless-stopped
-
 
   radius:
     build:
       context: ./radius
       dockerfile: Dockerfile
-
     container_name: isp_radius
-
     depends_on:
       mysql:
         condition: service_started
-
     ports:
       - "1812:1812/udp"
       - "1813:1813/udp"
-
     networks:
       - isp_network
-
     restart: unless-stopped
 
+  # ========== خادم L2TP/IPsec ==========
+  vpn:
+    image: hwdsl2/ipsec-vpn-server:latest
+    container_name: isp_vpn
+    restart: unless-stopped
+    privileged: true
+    environment:
+      VPN_IPSEC_PSK: "ShamSTC-IPsec-PSK-ChangeMe-2026!"
+      VPN_USER: "mtuser"
+      VPN_PASSWORD: "MtUser-Pass-ChangeMe!"
+      # فرع لكل منطقة: user password user2 password2 ...
+      VPN_ADDL_USERS: "mt-daraa DaraaPass123 mt-damascus DamPass123 mt-aleppo AlepPass123"
+    ports:
+      - "500:500/udp"
+      - "4500:4500/udp"
+      - "1701:1701/udp"
+    volumes:
+      - vpn_data:/etc/ipsec.d
+      - /lib/modules:/lib/modules:ro
+    # vpn يحتاج host تقريباً ليعمل الـ tunnel بشكل صحيح
+    network_mode: host
 
   backend:
     build:
       context: .
       dockerfile: Dockerfile
-
     container_name: isp_backend
-
     depends_on:
       mysql:
         condition: service_healthy
-
       redis:
         condition: service_started
-
       radius:
         condition: service_started
-
-    ports:
-      - "5000:5000"
-
+    # مهم: ليرى عملاء L2TP على السيرفر
+    network_mode: host
     environment:
-
       ASPNETCORE_ENVIRONMENT: Development
       ASPNETCORE_URLS: http://+:5000
-
-      ConnectionStrings__DefaultConnection: Server=mysql;Port=3306;Database=isp_system;User=root;Password=RootP@ssw0rd2026!
-      ConnectionStrings__RadiusConnection: Server=mysql;Port=3306;Database=isp_system;User=root;Password=RootP@ssw0rd2026!
-
-      Redis__ConnectionString: redis:6379
-
-      RadiusServer__Host: isp_radius
+      # مع host mode: استخدم 127.0.0.1 + المنافذ المنشورة
+      ConnectionStrings__DefaultConnection: Server=127.0.0.1;Port=3309;Database=isp_system;User=root;Password=RootP@ssw0rd2026!
+      ConnectionStrings__RadiusConnection: Server=127.0.0.1;Port=3309;Database=isp_system;User=root;Password=RootP@ssw0rd2026!
+      Redis__ConnectionString: 127.0.0.1:6379
+      RadiusServer__Host: 127.0.0.1
       RadiusServer__Port: 1812
       RadiusServer__Secret: Sham@mm@r!1993#Riad#1991
-
       Jwt__Key: SuperSecureSecretKeyForISPSystem2026WithMoreThan256BitsOfLength!
       Jwt__Issuer: ISPSystem
       Jwt__Audience: ISPSystemFrontend
-
       Logging__LogLevel__Default: Debug
       Logging__LogLevel__Microsoft.AspNetCore: Information
-
-      MikroTik__Ip: 10.50.0.2
+      # افتراضي لجهاز واحد (الأجهزة المتعددة تُدار من جدول MikroTikDevices)
+      MikroTik__Ip: 192.168.42.10
       MikroTik__ApiPort: 8728
-      MikroTik__User: admin
-      MikroTik__Pass: sham@#$
+      MikroTik__User: api-sham
+      MikroTik__Pass: ApiStrongPass2026
       MikroTik__Enabled: "true"
-
     volumes:
       - dataprotection_keys:/root/.aspnet/DataProtection-Keys
-
-    networks:
-      - isp_network
-
     restart: unless-stopped
-
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-
     container_name: isp_frontend
-
     depends_on:
-      backend:
-        condition: service_started
-
+      - backend
     ports:
       - "8080:8080"
-
     networks:
       - isp_network
-
     restart: unless-stopped
-
 
 networks:
   isp_network:
     driver: bridge
 
-
 volumes:
   mysql_data:
   redis_data:
   dataprotection_keys:
+  vpn_data:
