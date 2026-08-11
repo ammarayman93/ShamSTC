@@ -9,8 +9,8 @@ services:
       MYSQL_DATABASE: isp_system
       MYSQL_USER: isp_user
       MYSQL_PASSWORD: SecureP@ssw0rd2026!
-  ports:
-    - "3310:3306"
+    ports:
+      - "3310:3306"
     volumes:
       - mysql_data:/var/lib/mysql
     networks:
