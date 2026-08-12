@@ -2,6 +2,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Text;
 using System.Threading.Tasks;
 
 namespace ISPSystem.Services
@@ -30,97 +31,148 @@ namespace ISPSystem.Services
             {
                 var builder = new MySqlConnectionStringBuilder(_connectionString);
                 var database = builder.Database;
-                var user = builder.UserID;
-                var password = builder.Password;
-                var server = builder.Server;
+                var user = string.IsNullOrEmpty(builder.UserID) ? "root" : builder.UserID;
+                var password = builder.Password ?? "";
+                var server = string.IsNullOrEmpty(builder.Server) ? "mysql" : builder.Server;
+                var port = builder.Port == 0 ? 3306u : builder.Port;
 
-                var arguments = $"-h {server} -u {user} -p{password} {database} > \"{filePath}\"";
+                var mysqldump = FindTool("mysqldump");
+                if (mysqldump == null)
+                    throw new Exception("mysqldump غير موجود داخل الحاوية. ثبّت default-mysql-client في Dockerfile.");
 
-                var processStartInfo = new ProcessStartInfo
+                var psi = new ProcessStartInfo
                 {
-                    FileName = "C:\\Program Files\\MySQL\\MySQL Server 8.0\\bin\\mysqldump.exe",
-                    Arguments = arguments,
+                    FileName = mysqldump,
+                    Arguments = $"--host={server} --port={port} --user={user} --single-transaction --routines --triggers --events --set-gtid-purged=OFF {database}",
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
                     UseShellExecute = false,
-                    CreateNoWindow = true
+                    CreateNoWindow = true,
                 };
+                // تجنب مشاكل الرموز الخاصة في كلمة المرور داخل سطر الأوامر
+                psi.Environment["MYSQL_PWD"] = password;
 
-                using (var process = new Process { StartInfo = processStartInfo })
+                using var process = new Process { StartInfo = psi };
+                process.Start();
+
+                await using (var fs = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None))
+                await using (var writer = new StreamWriter(fs, new UTF8Encoding(false)))
                 {
-                    process.Start();
-                    await Task.Run(() => process.WaitForExit());
+                    var stdoutTask = process.StandardOutput.BaseStream.CopyToAsync(fs);
+                    var stderrTask = process.StandardError.ReadToEndAsync();
+                    await Task.WhenAll(stdoutTask, process.WaitForExitAsync());
+                    var error = await stderrTask;
 
                     if (process.ExitCode != 0)
                     {
-                        var error = await process.StandardError.ReadToEndAsync();
-                        throw new Exception($"Backup failed: {error}");
+                        if (File.Exists(filePath)) File.Delete(filePath);
+                        throw new Exception($"Backup failed (exit {process.ExitCode}): {error}");
                     }
                 }
+
+                if (!File.Exists(filePath) || new FileInfo(filePath).Length == 0)
+                    throw new Exception("تم إنشاء ملف النسخة لكنه فارغ.");
 
                 return filePath;
             }
             catch (Exception ex)
             {
-                throw new Exception($"Backup error: {ex.Message}");
+                throw new Exception($"Backup error: {ex.Message}", ex);
             }
         }
 
         public async Task<string> RestoreBackupAsync(string backupFilePath)
         {
+            if (string.IsNullOrWhiteSpace(backupFilePath) || !File.Exists(backupFilePath))
+                throw new Exception("ملف الاستعادة غير موجود.");
+
             try
             {
                 var builder = new MySqlConnectionStringBuilder(_connectionString);
                 var database = builder.Database;
-                var user = builder.UserID;
-                var password = builder.Password;
-                var server = builder.Server;
+                var user = string.IsNullOrEmpty(builder.UserID) ? "root" : builder.UserID;
+                var password = builder.Password ?? "";
+                var server = string.IsNullOrEmpty(builder.Server) ? "mysql" : builder.Server;
+                var port = builder.Port == 0 ? 3306u : builder.Port;
 
-                var arguments = $"-h {server} -u {user} -p{password} {database} < \"{backupFilePath}\"";
+                var mysql = FindTool("mysql");
+                if (mysql == null)
+                    throw new Exception("mysql client غير موجود داخل الحاوية. ثبّت default-mysql-client في Dockerfile.");
 
-                var processStartInfo = new ProcessStartInfo
+                var psi = new ProcessStartInfo
                 {
-                    FileName = "mysql",
-                    Arguments = arguments,
+                    FileName = mysql,
+                    Arguments = $"--host={server} --port={port} --user={user} {database}",
+                    RedirectStandardInput = true,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
                     UseShellExecute = false,
-                    CreateNoWindow = true
+                    CreateNoWindow = true,
                 };
+                psi.Environment["MYSQL_PWD"] = password;
 
-                using (var process = new Process { StartInfo = processStartInfo })
+                using var process = new Process { StartInfo = psi };
+                process.Start();
+
+                await using (var file = File.OpenRead(backupFilePath))
                 {
-                    process.Start();
-                    await Task.Run(() => process.WaitForExit());
-
-                    if (process.ExitCode != 0)
-                    {
-                        var error = await process.StandardError.ReadToEndAsync();
-                        throw new Exception($"Restore failed: {error}");
-                    }
+                    await file.CopyToAsync(process.StandardInput.BaseStream);
+                    await process.StandardInput.BaseStream.FlushAsync();
+                    process.StandardInput.Close();
                 }
+
+                var error = await process.StandardError.ReadToEndAsync();
+                await process.WaitForExitAsync();
+
+                if (process.ExitCode != 0)
+                    throw new Exception($"Restore failed (exit {process.ExitCode}): {error}");
 
                 return "Restore completed successfully";
             }
             catch (Exception ex)
             {
-                throw new Exception($"Restore error: {ex.Message}");
+                throw new Exception($"Restore error: {ex.Message}", ex);
             }
         }
 
-        public async Task CleanOldBackupsAsync(int daysToKeep = 30)
+        public Task CleanOldBackupsAsync(int daysToKeep = 30)
         {
             var cutoffDate = DateTime.Now.AddDays(-daysToKeep);
-            var files = Directory.GetFiles(_backupPath, "backup_*.sql");
+            if (!Directory.Exists(_backupPath))
+                return Task.CompletedTask;
 
-            foreach (var file in files)
+            foreach (var file in Directory.GetFiles(_backupPath, "backup_*.sql"))
             {
                 if (File.GetCreationTime(file) < cutoffDate)
-                {
                     File.Delete(file);
-                }
             }
-            await Task.CompletedTask;
+            return Task.CompletedTask;
+        }
+
+        private static string FindTool(string name)
+        {
+            // Linux / Docker
+            var linuxPaths = new[]
+            {
+                $"/usr/bin/{name}",
+                $"/usr/local/bin/{name}",
+                name // PATH
+            };
+            foreach (var p in linuxPaths)
+            {
+                try
+                {
+                    if (p == name) return name;
+                    if (File.Exists(p)) return p;
+                }
+                catch { /* ignore */ }
+            }
+
+            // Windows (تطوير محلي)
+            var win = $@"C:\Program Files\MySQL\MySQL Server 8.0\bin\{name}.exe";
+            if (File.Exists(win)) return win;
+
+            return null;
         }
     }
 }
