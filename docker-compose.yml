@@ -79,6 +79,7 @@ services:
       MikroTik__Enabled: "true"
     volumes:
       - dataprotection_keys:/root/.aspnet/DataProtection-Keys
+      - backend_backups:/app/Backups
     networks:
       - isp_network
     restart: unless-stopped
@@ -102,3 +103,4 @@ volumes:
   mysql_data:
   redis_data:
   dataprotection_keys:
+  backend_backups:
