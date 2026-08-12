@@ -22,6 +22,11 @@ RUN dotnet publish "ISPSystem.csproj" -c Release -o /app/publish /p:UseAppHost=f
 FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
 WORKDIR /app
 
+# مطلوب لنسخ/استعادة قواعد البيانات
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends default-mysql-client \
+    && rm -rf /var/lib/apt/lists/*
+
 # متغيرات البيئة
 ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=true
 ENV ASPNETCORE_HTTP_PORTS="5000"
