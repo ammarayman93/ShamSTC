@@ -4,8 +4,11 @@ using System.Collections.Generic;
 namespace ISPSystem.Models
 {
     /// <summary>
-    /// سيرفر MikroTik في فرع/منطقة — يُدار مركزياً عبر VPN (WireGuard)
-    /// IpAddress = عنوان الوصول للـ API (عادة VpnIp مثل 10.50.0.2)
+    /// سيرفر MikroTik في فرع/منطقة — يُدار مركزياً عبر VPN
+    /// (L2TP أو WireGuard أو اتصال مباشر).
+    ///
+    /// IpAddress / VpnIp = عنوان الوصول للـ API بعد إنشاء نفق VPN
+    /// مثال بعد اتصال L2TP: 10.50.0.2
     /// </summary>
     public class MikroTikDevice
     {
@@ -18,15 +21,21 @@ namespace ISPSystem.Models
         public string Region { get; set; }
 
         /// <summary>
-        /// عنوان الاتصال بالـ API (يفضّل IP داخل WireGuard مثل 10.50.0.2)
+        /// عنوان الاتصال بالـ API (يفضّل IP داخل النفق مثل 10.50.0.2)
         /// </summary>
         public string IpAddress { get; set; }
 
         /// <summary>IP عام للراوتر إن وُجد (اختياري)</summary>
         public string PublicIp { get; set; }
 
-        /// <summary>نفس IpAddress في معظم الحالات — للتوضيح في الواجهة</summary>
+        /// <summary>
+        /// IP داخل نفق VPN (L2TP/WireGuard).
+        /// إن وُجد يُستخدم للاتصال بالـ API بدل IpAddress.
+        /// </summary>
         public string VpnIp { get; set; }
+
+        /// <summary>نوع الاتصال: L2TP | WireGuard | Direct</summary>
+        public string ConnectionType { get; set; } = "L2TP";
 
         public string Username { get; set; }
         public string Password { get; set; }

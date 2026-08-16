@@ -79,6 +79,8 @@ namespace ISPSystem.Services
 
         public async Task<MikroTikDevice> Create(MikroTikDevice device)
         {
+            if (string.IsNullOrWhiteSpace(device.ConnectionType))
+                device.ConnectionType = "L2TP";
             device.CreatedAt = DateTime.Now;
             device.IsOnline = false;
             device.Status = "Unknown";
@@ -112,6 +114,8 @@ namespace ISPSystem.Services
             device.IsEnabled = dto.IsEnabled;
             device.Location = dto.Location;
             device.Notes = dto.Notes;
+            if (!string.IsNullOrWhiteSpace(dto.ConnectionType))
+                device.ConnectionType = dto.ConnectionType;
 
             await _context.SaveChangesAsync();
             return device;

@@ -1,4 +1,4 @@
-﻿using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using ISPSystem.Services;
 using ISPSystem.DTOs;
@@ -6,12 +6,13 @@ using ISPSystem.Helpers;
 using System;
 using System.Threading.Tasks;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace ISPSystem.Controllers
 {
     [ApiController]
     [Route("api/mikrotik")]
-    [Authorize] // 🔐 الكنترولر بالكامل يتطلب تسجيل الدخول
+    [Authorize]
     public class MikroTikController : ControllerBase
     {
         private readonly MikroTikService _mikroTik;
@@ -21,18 +22,44 @@ namespace ISPSystem.Controllers
             _mikroTik = mikroTik;
         }
 
-        // 🟢 جلب المستخدمين النشطين (Active Connections) حاليًا على سيرفر ميكروتيك
+        /// <summary>
+        /// جلب المستخدمين النشطين.
+        /// deviceId اختياري: إن لم يُمرَّر يُستخدم الجهاز الافتراضي.
+        /// all=true يجلب من كل الأجهزة المسجّلة.
+        /// </summary>
         [HttpGet("active")]
-        public async Task<IActionResult> GetActiveUsers()
+        public async Task<IActionResult> GetActiveUsers([FromQuery] int? deviceId = null, [FromQuery] bool all = false)
         {
             try
             {
-                var users = await _mikroTik.GetActiveUsers();
+                if (all)
+                {
+                    var results = await _mikroTik.GetActiveUsersAllDevices();
+                    var payload = results.Select(r => new
+                    {
+                        deviceId = r.Device?.Id,
+                        deviceName = r.Device?.Name ?? "default",
+                        region = r.Device?.Region,
+                        count = r.Users.Count,
+                        error = r.Error,
+                        list = r.Users
+                    }).ToList();
+                    var total = results.Sum(r => r.Users.Count);
+                    return Ok(ApiResponse<object>.Ok(new { servers = payload, totalCount = total }));
+                }
 
-                // 🛠️ تم الإصلاح: استخدام اسم الكلاس الصحيح ActiveUser بدلاً من المتغير users
-                var result = users ?? new List<ActiveUser>();
+                if (deviceId.HasValue && deviceId.Value > 0)
+                {
+                    var users = await _mikroTik.GetActiveUsersByDeviceId(deviceId.Value);
+                    var result = users ?? new List<ActiveUser>();
+                    return Ok(ApiResponse<object>.Ok(new { list = result, count = result.Count, deviceId }));
+                }
 
-                return Ok(ApiResponse<object>.Ok(new { list = result, count = result.Count }));
+                {
+                    var users = await _mikroTik.GetActiveUsers();
+                    var result = users ?? new List<ActiveUser>();
+                    return Ok(ApiResponse<object>.Ok(new { list = result, count = result.Count }));
+                }
             }
             catch (Exception ex)
             {
@@ -40,13 +67,14 @@ namespace ISPSystem.Controllers
             }
         }
 
-        // 📋 جلب كافة مستخدمي الـ PPPoE المسجلين في السيرفر
         [HttpGet("users")]
-        public async Task<IActionResult> GetAllUsers()
+        public async Task<IActionResult> GetAllUsers([FromQuery] int? deviceId = null)
         {
             try
             {
-                var users = await _mikroTik.GetAllPppUsers();
+                var users = deviceId.HasValue && deviceId.Value > 0
+                    ? await _mikroTik.GetAllPppUsersByDeviceId(deviceId.Value)
+                    : await _mikroTik.GetAllPppUsers();
                 return Ok(ApiResponse<object>.Ok(users));
             }
             catch (Exception ex)
@@ -55,43 +83,54 @@ namespace ISPSystem.Controllers
             }
         }
 
-        // 🚫 تعطيل حساب مستخدم (إيقاف مؤقت للاشتراك)
         [HttpPost("disable/{username}")]
         [Authorize(Roles = "Admin,Support")]
-        public async Task<IActionResult> DisableUser(string username)
+        public async Task<IActionResult> DisableUser(string username, [FromQuery] int? deviceId = null)
         {
-            var result = await _mikroTik.DisablePppUser(username);
+            bool result;
+            if (deviceId.HasValue && deviceId.Value > 0)
+                result = await _mikroTik.DisablePppUserByDeviceId(username, deviceId.Value);
+            else
+                result = await _mikroTik.DisablePppUser(username);
+
             if (result)
                 return Ok(ApiResponse<string>.Ok($"تم تعطيل حساب المستخدم {username} بنجاح"));
 
             return BadRequest(ApiResponse<string>.Fail($"فشل تعطيل حساب المستخدم {username}"));
         }
 
-        // ▶️ تمكين وتفعيل حساب مستخدم معطل
         [HttpPost("enable/{username}")]
         [Authorize(Roles = "Admin,Support")]
-        public async Task<IActionResult> EnableUser(string username)
+        public async Task<IActionResult> EnableUser(string username, [FromQuery] int? deviceId = null)
         {
-            var result = await _mikroTik.EnablePppUser(username);
+            bool result;
+            if (deviceId.HasValue && deviceId.Value > 0)
+                result = await _mikroTik.EnablePppUserByDeviceId(username, deviceId.Value);
+            else
+                result = await _mikroTik.EnablePppUser(username);
+
             if (result)
                 return Ok(ApiResponse<string>.Ok($"تم تفعيل حساب المستخدم {username} بنجاح"));
 
             return BadRequest(ApiResponse<string>.Fail($"فشل تفعيل حساب المستخدم {username}"));
         }
 
-        // ❌ حذف حساب مستخدم نهائيًا من الراوتر
         [HttpDelete("user/{username}")]
-        [Authorize(Roles = "Admin")] // الحذف متاح للمسؤول المباشر فقط
-        public async Task<IActionResult> DeleteUser(string username)
+        [Authorize(Roles = "Admin")]
+        public async Task<IActionResult> DeleteUser(string username, [FromQuery] int? deviceId = null)
         {
-            var result = await _mikroTik.RemovePppUser(username);
+            bool result;
+            if (deviceId.HasValue && deviceId.Value > 0)
+                result = await _mikroTik.RemovePppUserByDeviceId(username, deviceId.Value);
+            else
+                result = await _mikroTik.RemovePppUser(username);
+
             if (result)
                 return Ok(ApiResponse<string>.Ok($"تم حذف المستخدم {username} من السيرفر بنجاح"));
 
             return BadRequest(ApiResponse<string>.Fail($"فشل حذف المستخدم {username}"));
         }
 
-        // ➕ إضافة مستخدم PPPoE جديد لروتر برودباند
         [HttpPost("user")]
         [Authorize(Roles = "Admin,Support")]
         public async Task<IActionResult> AddUser([FromBody] AddUserRequest request)
@@ -99,53 +138,69 @@ namespace ISPSystem.Controllers
             if (request == null || string.IsNullOrEmpty(request.Username))
                 return BadRequest(ApiResponse<string>.Fail("بيانات طلب إضافة مستخدم غير صالحة"));
 
-            var result = await _mikroTik.AddPppUser(request.Username, request.Password, request.Profile, request.Comment);
+            bool result;
+            if (request.DeviceId.HasValue && request.DeviceId.Value > 0)
+                result = await _mikroTik.AddPppUserByDeviceId(
+                    request.Username, request.Password, request.Profile, request.Comment ?? "", request.DeviceId.Value);
+            else
+                result = await _mikroTik.AddPppUser(request.Username, request.Password, request.Profile, request.Comment);
+
             if (result)
                 return Ok(ApiResponse<string>.Ok($"تم إنشاء حساب المستخدم {request.Username} بنجاح"));
 
             return BadRequest(ApiResponse<string>.Fail("فشل إنشاء حساب المستخدم، قد يكون الاسم مكررًا بالسيرفر"));
         }
 
-        // ⚡ تعديل سرعة اشتراك المستخدم (تغيير الـ Profile)
         [HttpPut("user/{username}/speed")]
         [Authorize(Roles = "Admin,Support")]
-        public async Task<IActionResult> UpdateUserSpeed(string username, [FromBody] UpdateSpeedRequest request)
+        public async Task<IActionResult> UpdateUserSpeed(string username, [FromBody] UpdateSpeedRequest request, [FromQuery] int? deviceId = null)
         {
             if (request == null || string.IsNullOrEmpty(request.Profile))
                 return BadRequest(ApiResponse<string>.Fail("البروفايل المختار غير صالح"));
 
-            var result = await _mikroTik.UpdateUserSpeed(username, request.Profile);
+            var id = deviceId ?? request.DeviceId;
+            bool result;
+            if (id.HasValue && id.Value > 0)
+                result = await _mikroTik.UpdateUserSpeedByDeviceId(username, request.Profile, id.Value);
+            else
+                result = await _mikroTik.UpdateUserSpeed(username, request.Profile);
+
             if (result)
                 return Ok(ApiResponse<string>.Ok($"تم تحديث سرعة الحساب {username} إلى {request.Profile}"));
 
             return BadRequest(ApiResponse<string>.Fail($"فشل تحديث سرعة الحساب {username}"));
         }
 
-        // 🧱 حظر عنوان IP محدد يدويًا (بإضافته إلى الـ Address List أو الـ Firewall)
         [HttpPost("block/{address}")]
         [Authorize(Roles = "Admin,Support")]
-        public async Task<IActionResult> BlockAddress(string address, [FromQuery] string comment = "Blocked by ISP System")
+        public async Task<IActionResult> BlockAddress(string address, [FromQuery] string comment = "Blocked by ISP System", [FromQuery] int? deviceId = null)
         {
-            var result = await _mikroTik.BlockUserByAddress(address, comment);
+            ISPSystem.Models.MikroTikDevice device = null;
+            if (deviceId.HasValue && deviceId.Value > 0)
+                device = await _mikroTik.GetDeviceAsync(deviceId.Value);
+
+            var result = await _mikroTik.BlockUserByAddress(address, comment, device);
             if (result)
                 return Ok(ApiResponse<string>.Ok($"تم إدراج العنوان {address} في قائمة الحظر بنجاح"));
 
             return BadRequest(ApiResponse<string>.Fail($"فشل حظر العنوان {address}"));
         }
 
-        // 🔓 إلغاء حظر عنوان IP وإزالته من قائمة الجدار الناري
         [HttpDelete("block/{address}")]
         [Authorize(Roles = "Admin,Support")]
-        public async Task<IActionResult> UnblockAddress(string address)
+        public async Task<IActionResult> UnblockAddress(string address, [FromQuery] int? deviceId = null)
         {
-            var result = await _mikroTik.UnblockUserByAddress(address);
+            ISPSystem.Models.MikroTikDevice device = null;
+            if (deviceId.HasValue && deviceId.Value > 0)
+                device = await _mikroTik.GetDeviceAsync(deviceId.Value);
+
+            var result = await _mikroTik.UnblockUserByAddress(address, device);
             if (result)
                 return Ok(ApiResponse<string>.Ok($"تم إلغاء حظر العنوان {address} وسماح المرور له"));
 
             return BadRequest(ApiResponse<string>.Fail($"فشل إلغاء حظر العنوان {address}"));
         }
 
-        // 🚀 إضافة Profile سرعة مخصص جديد للتحكم بالباندويث (Rate-Limit)
         [HttpPost("profile")]
         [Authorize(Roles = "Admin")]
         public async Task<IActionResult> AddProfile([FromBody] AddProfileRequest request)
@@ -153,32 +208,56 @@ namespace ISPSystem.Controllers
             if (request == null || string.IsNullOrEmpty(request.Name))
                 return BadRequest(ApiResponse<string>.Fail("بيانات البروفايل غير مكتملة"));
 
-            var result = await _mikroTik.AddProfile(request.Name, request.RateLimit, request.ParentQueue);
+            bool result;
+            if (request.DeviceId.HasValue && request.DeviceId.Value > 0)
+                result = await _mikroTik.AddProfileByDeviceId(request.Name, request.RateLimit, request.DeviceId.Value, request.ParentQueue);
+            else
+                result = await _mikroTik.AddProfile(request.Name, request.RateLimit, request.ParentQueue);
+
             if (result)
                 return Ok(ApiResponse<string>.Ok($"تم إنشاء بروفايل السرعة {request.Name} بنجاح على ميكروتيك"));
 
             return BadRequest(ApiResponse<string>.Fail($"فشل إنشاء بروفايل السرعة {request.Name}"));
         }
+
+        /// <summary>فصل جلسة نشطة (Kick)</summary>
+        [HttpPost("kick/{username}")]
+        [Authorize(Roles = "Admin,Support")]
+        public async Task<IActionResult> KickUser(string username, [FromQuery] int? deviceId = null)
+        {
+            bool result;
+            if (deviceId.HasValue && deviceId.Value > 0)
+                result = await _mikroTik.KickActiveUserByDeviceId(username, deviceId.Value);
+            else
+                result = await _mikroTik.KickActiveUser(username);
+
+            if (result)
+                return Ok(ApiResponse<string>.Ok($"تم فصل الجلسة {username}"));
+            return BadRequest(ApiResponse<string>.Fail($"فشل فصل الجلسة {username}"));
+        }
     }
 
-    // 🗂️ نماذج البيانات الممررة عبر الـ Body Requests
     public class AddUserRequest
     {
         public string Username { get; set; }
         public string Password { get; set; }
         public string Profile { get; set; }
         public string Comment { get; set; }
+        /// <summary>معرّف جهاز MikroTik (من جدول MikroTikDevices)</summary>
+        public int? DeviceId { get; set; }
     }
 
     public class UpdateSpeedRequest
     {
         public string Profile { get; set; }
+        public int? DeviceId { get; set; }
     }
 
     public class AddProfileRequest
     {
         public string Name { get; set; }
-        public string RateLimit { get; set; } // مثال: 10M/10M
+        public string RateLimit { get; set; }
         public string ParentQueue { get; set; } = "none";
+        public int? DeviceId { get; set; }
     }
 }
