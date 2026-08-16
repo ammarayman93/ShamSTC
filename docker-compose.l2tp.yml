@@ -1,0 +1,40 @@
+# L2TP/IPsec VPN Server — يُشغَّل على نفس الـ VPS مع مشروع ShamSTC
+# الاستخدام:
+#   cd l2tp
+#   cp .env.example .env   # عدّل كلمات المرور
+#   docker compose -f docker-compose.l2tp.yml up -d
+#
+# بعد التشغيل: كل MikroTik يتصل كـ L2TP Client ويحصل على IP من 10.50.0.0/24
+
+services:
+  ipsec-vpn-server:
+    image: hwdsl2/ipsec-vpn-server:latest
+    container_name: isp_l2tp
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "500:500/udp"
+      - "4500:4500/udp"
+      # منفذ L2TP الداخلي 1701 لا يُفضّل فتحه للعالم إن كان خلف IPsec
+    privileged: true
+    volumes:
+      - ./vpn-data:/etc/ipsec.d
+      - /lib/modules:/lib/modules:ro
+    environment:
+      # يُفضّل تعريفها في .env
+      VPN_IPSEC_PSK: ${VPN_IPSEC_PSK:-ChangeMeStrongPsk2026}
+      VPN_USER: ${VPN_USER:-mikrotik1}
+      VPN_PASSWORD: ${VPN_PASSWORD:-ChangeMeUserPass}
+      # مستخدمون إضافيون: user1 pass1 user2 pass2 ...
+      VPN_ADDL_USERS: ${VPN_ADDL_USERS:-}
+      # شبكة النفق (الـ VPS سيكون 192.168.42.1 افتراضياً في هذه الصورة)
+      # للتحكم أدق راجع وثائق الصورة
+    networks:
+      - isp_network
+      - default
+
+networks:
+  isp_network:
+    external: true
+    name: shamstc_isp_network
