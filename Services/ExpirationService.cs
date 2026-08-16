@@ -6,14 +6,15 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using ISPSystem.Data;
-using ISPSystem.Services;
+using ISPSystem.Models;
 using Microsoft.EntityFrameworkCore;
 
 namespace ISPSystem.Services
 {
     /// <summary>
     /// يفصل العملاء عند انتهاء الاشتراك.
-    /// EndDate مضبوط على الساعة 12:00 ظهراً، فيُفصل العميل عند الظهر في يوم الانتهاء.
+    /// EndDate مضبوط على الساعة 12:00 ظهراً.
+    /// يستخدم MikroTikServerId الخاص بالعميل لفصل الجلسة من الراوتر الصحيح.
     /// </summary>
     public class ExpirationService : BackgroundService
     {
@@ -28,7 +29,7 @@ namespace ISPSystem.Services
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            _logger.LogInformation("🚀 ExpirationService بدأ العمل (فصل عند الساعة 12 ظهراً حسب EndDate)");
+            _logger.LogInformation("🚀 ExpirationService بدأ العمل (فصل عند الساعة 12 ظهراً حسب EndDate + multi MikroTik)");
 
             while (!stoppingToken.IsCancellationRequested)
             {
@@ -42,7 +43,6 @@ namespace ISPSystem.Services
 
                     var now = DateTime.Now;
 
-                    // الاشتراكات المنتهية (EndDate = يوم الانتهاء 12:00 ظهراً)
                     var expiredSubs = await db.Subscriptions
                         .Include(s => s.Client)
                         .Where(x => x.EndDate <= now && x.IsActive)
@@ -50,41 +50,52 @@ namespace ISPSystem.Services
 
                     if (expiredSubs.Any())
                     {
-                        _logger.LogInformation("⏰ تم العثور على {Count} اشتراك منتهٍ (بعد الظهر أو تجاوز التاريخ)", expiredSubs.Count);
+                        _logger.LogInformation(
+                            "⏰ تم العثور على {Count} اشتراك منتهٍ",
+                            expiredSubs.Count);
 
                         foreach (var sub in expiredSubs)
                         {
                             sub.IsActive = false;
                             sub.Status = "Expired";
 
-                            if (sub.Client != null)
+                            if (sub.Client == null)
+                                continue;
+
+                            var username = sub.Client.Username;
+                            var disabled = await radius.DisableUser(username);
+                            await radius.DisconnectUser(username);
+
+                            if (mikroTik != null)
                             {
-                                var disabled = await radius.DisableUser(sub.Client.Username);
-                                await radius.DisconnectUser(sub.Client.Username);
-
-                                if (mikroTik != null)
+                                try
                                 {
-                                    try { await mikroTik.KickActiveUser(sub.Client.Username); }
-                                    catch (Exception kex)
-                                    {
-                                        _logger.LogWarning(kex, "فشل فصل جلسة MikroTik لـ {User}", sub.Client.Username);
-                                    }
+                                    await KickOnClientRouter(mikroTik, db, sub.Client);
                                 }
-
-                                var stillHasActive = await db.Subscriptions
-                                    .AnyAsync(s => s.ClientId == sub.ClientId
-                                                && s.IsActive
-                                                && s.EndDate > now, stoppingToken);
-
-                                if (!stillHasActive)
+                                catch (Exception kex)
                                 {
-                                    sub.Client.Status = "Expired";
+                                    _logger.LogWarning(
+                                        kex,
+                                        "فشل فصل جلسة MikroTik لـ {User} (ServerId={Sid})",
+                                        username,
+                                        sub.Client.MikroTikServerId);
                                 }
-
-                                _logger.LogInformation(
-                                    "⛔ تم تعطيل العميل {Username} في RADIUS عند انتهاء الاشتراك ({End:yyyy-MM-dd HH:mm}) (نتيجة: {Result})",
-                                    sub.Client.Username, sub.EndDate, disabled);
                             }
+
+                            var stillHasActive = await db.Subscriptions
+                                .AnyAsync(s => s.ClientId == sub.ClientId
+                                            && s.IsActive
+                                            && s.EndDate > now, stoppingToken);
+
+                            if (!stillHasActive)
+                                sub.Client.Status = "Expired";
+
+                            _logger.LogInformation(
+                                "⛔ تعطيل {Username} عند انتهاء الاشتراك ({End:yyyy-MM-dd HH:mm}) RADIUS={Result} MT={Sid}",
+                                username,
+                                sub.EndDate,
+                                disabled,
+                                sub.Client.MikroTikServerId);
                         }
 
                         await db.SaveChangesAsync(stoppingToken);
@@ -111,9 +122,28 @@ namespace ISPSystem.Services
                     _logger.LogError(ex, "❌ خطأ في ExpirationService");
                 }
 
-                // كل 5 دقائق لاستجابة أدق حول الساعة 12
                 await Task.Delay(TimeSpan.FromMinutes(5), stoppingToken);
             }
+        }
+
+        /// <summary>
+        /// فصل الجلسة من الراوتر المرتبط بالعميل، أو الافتراضي إن لم يُحدد.
+        /// </summary>
+        private static async Task KickOnClientRouter(
+            MikroTikService mikroTik,
+            AppDbContext db,
+            Client client)
+        {
+            if (client.MikroTikServerId.HasValue && client.MikroTikServerId.Value > 0)
+            {
+                await mikroTik.KickActiveUserByDeviceId(
+                    client.Username,
+                    client.MikroTikServerId.Value);
+                return;
+            }
+
+            // بدون ServerId: جرب الجهاز الافتراضي
+            await mikroTik.KickActiveUser(client.Username);
         }
     }
 }

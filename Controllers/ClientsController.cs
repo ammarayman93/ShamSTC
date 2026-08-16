@@ -456,7 +456,7 @@ namespace ISPSystem.Controllers
 
             // 3) فصل الجلسة الفعلية من المايكروتيك فوراً
             bool kicked = false;
-            try { kicked = await _mikroTik.KickActiveUser(client.Username); }
+            try { kicked = await KickClientSession(client); }
             catch (Exception ex) { Console.WriteLine($"KickActiveUser: {ex.Message}"); }
 
             await _audit.Log("Suspend", "Client", id);
@@ -529,7 +529,7 @@ namespace ISPSystem.Controllers
                 {
                     await _radius.UpdateSpeed(client.Username, sub.Plan.Speed);
                 }
-                try { await _mikroTik.KickActiveUser(client.Username); }
+                try { await KickClientSession(client); }
                 catch { /* لا جلسة */ }
 
                 // فاتورة + دفعة + صندوق التفعيلات (ACT)
@@ -629,7 +629,7 @@ namespace ISPSystem.Controllers
 
             // فصل الجلسة ليطبّق العميل السرعة الجديدة عند إعادة الاتصال
             bool kicked = false;
-            try { kicked = await _mikroTik.KickActiveUser(client.Username); }
+            try { kicked = await KickClientSession(client); }
             catch (Exception ex) { Console.WriteLine($"Kick after speed: {ex.Message}"); }
 
             await _audit.Log("UpdateSpeed", "Client", id);
@@ -868,7 +868,7 @@ namespace ISPSystem.Controllers
             else
             {
                 await _radius.DisableUser(client.Username);
-                try { await _mikroTik.KickActiveUser(client.Username); } catch { }
+                try { await KickClientSession(client); } catch { }
                 client.Status = "Suspended";
                 await _context.SaveChangesAsync();
             }
@@ -1022,5 +1022,32 @@ namespace ISPSystem.Controllers
                 return BadRequest(ApiResponse<string>.Fail($"فشل الحذف النهائي: {ex.Message}"));
             }
         }
+
+        /// <summary>فصل جلسة العميل من الراوتر المرتبط به (MikroTikServerId) أو الافتراضي</summary>
+        private async Task<bool> KickClientSession(Client client)
+        {
+            if (client == null || string.IsNullOrWhiteSpace(client.Username))
+                return false;
+            try
+            {
+                if (client.MikroTikServerId.HasValue && client.MikroTikServerId.Value > 0)
+                    return await _mikroTik.KickActiveUserByDeviceId(client.Username, client.MikroTikServerId.Value);
+                return await _mikroTik.KickActiveUser(client.Username);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"KickClientSession {client.Username}: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>جلب النشطين من راوتر العميل أو كل الأجهزة عند الحاجة</summary>
+        private async Task<List<ActiveUser>> GetActiveUsersForClient(Client client)
+        {
+            if (client?.MikroTikServerId.HasValue == true && client.MikroTikServerId.Value > 0)
+                return await _mikroTik.GetActiveUsersByDeviceId(client.MikroTikServerId.Value);
+            return await _mikroTik.GetActiveUsers();
+        }
+
     }
 }
