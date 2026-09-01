@@ -512,10 +512,14 @@ export default function Clients() {
         setSubmitting(true);
         setError('');
         try {
-            await api.put(`/clients/${selectedClient.id}/speed`, {
+            const response = await api.put(`/clients/${selectedClient.id}/speed`, {
                 speed: newSpeed.trim(),
             });
-            setSuccess('تم تحديث السرعة في RADIUS بنجاح');
+            const sessionKicked = response.data?.data?.sessionKicked
+                ?? response.data?.Data?.sessionKicked;
+            setSuccess(sessionKicked
+                ? 'تم حفظ السرعة وفصل الجلسة لتُطبّق عند إعادة الاتصال'
+                : 'تم حفظ السرعة؛ لا توجد جلسة PPP نشطة لفصلها');
             setTimeout(() => setSuccess(''), 3000);
             setSpeedDialogOpen(false);
             fetchClients();
@@ -1319,10 +1323,10 @@ const handleResetPasswordConfirm = async () => {
                     </Typography>
                     <TextField
                         fullWidth
-                        label="السرعة (مثال: 10M/10M أو 20M/5M)"
+                        label="السرعة (رفع/تنزيل، مثال: 5M/20M)"
                         value={newSpeed}
                         onChange={(e) => setNewSpeed(e.target.value)}
-                        helperText="الصيغة: تحميل/رفع  مثل 10M/10M"
+                        helperText="القيمة الأولى لرفع العميل والثانية لتنزيله وفق صيغة MikroTik."
                         autoFocus
                     />
                 </DialogContent>

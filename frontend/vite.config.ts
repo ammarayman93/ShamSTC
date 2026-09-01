@@ -26,7 +26,7 @@ export default defineConfig({
     },
 
     build: {
-        sourcemap: true,
-        minify: false, // ãÄŞÊğÇ ááÊÔÎíÕ
+        sourcemap: false,
+        minify: 'esbuild',
     },
 });

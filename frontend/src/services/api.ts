@@ -1,9 +1,13 @@
-﻿import axios from 'axios';
+﻿/// <reference types="vite/client" />
+import axios from 'axios';
 
-// 🔥 استخدم المسار النسبي وليس المسار الكامل
+// يستخدم التطوير عنوان الخادم المحلي، بينما يمر الإنتاج عبر Nginx
+// في المسار نفسه. ويمكن ضبط عنوان آخر صراحةً عبر VITE_API_BASE_URL.
+const apiBaseUrl = import.meta.env.VITE_API_BASE_URL
+    || (import.meta.env.DEV ? 'http://localhost:5000/api' : '/api');
+
 const api = axios.create({
-    baseURL: 'http://localhost:5000/api',  // للتطوير
-    // baseURL: '/api',                    // للإنتاج مع nginx
+    baseURL: apiBaseUrl,
     timeout: 60000,
     headers: { 'Content-Type': 'application/json' },
 });

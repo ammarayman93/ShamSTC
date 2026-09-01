@@ -1,6 +1,7 @@
 #nullable disable
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging;
 using ISPSystem.Data;
 using ISPSystem.Models;
@@ -30,11 +31,14 @@ namespace ISPSystem.Services
         private readonly bool _enabled;
         private readonly ILogger<MikroTikService> _logger;
         private readonly AppDbContext _db;
+        private readonly IMemoryCache _cache;
+        private const string ActiveUsersCacheKey = "mikrotik-active-users-snapshot";
 
         public MikroTikService(
             IConfiguration config,
             ILogger<MikroTikService> logger,
-            AppDbContext db)
+            AppDbContext db,
+            IMemoryCache cache)
         {
             // الجهاز الافتراضي من الإعدادات (للتوافق مع الكود القديم)
             _host = config["MikroTik:Ip"] ?? "127.0.0.1";
@@ -45,6 +49,7 @@ namespace ISPSystem.Services
             _enabled = config.GetValue<bool>("MikroTik:Enabled", true);
             _logger = logger;
             _db = db;
+            _cache = cache;
         }
 
         // =========================================================
@@ -689,41 +694,127 @@ namespace ISPSystem.Services
             return await GetActiveUsers(device);
         }
 
-        /// <summary>جلب المستخدمين النشطين من كل الأجهزة المفعّلة</summary>
-        public async Task<List<(MikroTikDevice Device, List<ActiveUser> Users, string Error)>> GetActiveUsersAllDevices()
+        /// <summary>
+        /// يجلب جلسات PPP الفعلية من كل الأجهزة المفعّلة بالتوازي.
+        /// لا تُعامل نتيجة RADIUS كمصدر نهائي عندما استجاب الراوتر المرتبط،
+        /// لأن سجل radacct قد يبقى مفتوحاً بعد انقطاع مفاجئ للعميل.
+        /// </summary>
+        public async Task<MikroTikActiveUsersSnapshot> GetActiveUsersSnapshotAsync()
         {
-            var devices = await _db.MikroTikDevices.Where(d => d.IsEnabled).ToListAsync();
-            var results = new List<(MikroTikDevice, List<ActiveUser>, string)>();
+            var devices = await _db.MikroTikDevices
+                .AsNoTracking()
+                .Where(d => d.IsEnabled)
+                .ToListAsync();
 
-            // إذا لا يوجد أجهزة في الجدول، استخدم الافتراضي
+            var snapshot = new MikroTikActiveUsersSnapshot();
+
+            // التوافق مع الإعداد القديم الذي يستخدم راوتراً افتراضياً فقط.
             if (devices.Count == 0)
             {
                 try
                 {
                     var users = await GetActiveUsersInternal(DefaultConn());
-                    results.Add((null, users, null));
+                    snapshot.DefaultRouterQueried = true;
+                    snapshot.DeviceResults.Add(new MikroTikActiveDeviceResult
+                    {
+                        Device = null,
+                        Users = users,
+                        Error = null
+                    });
+                    snapshot.Users.AddRange(users);
                 }
                 catch (Exception ex)
                 {
-                    results.Add((null, new List<ActiveUser>(), ex.Message));
+                    _logger.LogWarning(ex, "فشل جلب Active من الراوتر الافتراضي");
+                    snapshot.DeviceResults.Add(new MikroTikActiveDeviceResult
+                    {
+                        Device = null,
+                        Users = new List<ActiveUser>(),
+                        Error = ex.Message
+                    });
                 }
-                return results;
+
+                return snapshot;
             }
 
-            foreach (var d in devices)
+            var queries = devices.Select(async device =>
             {
                 try
                 {
-                    var users = await GetActiveUsers(d);
-                    results.Add((d, users, null));
+                    var users = await GetActiveUsers(device);
+                    foreach (var user in users)
+                    {
+                        user.MikroTikDeviceId = device.Id;
+                        user.MikroTikDeviceName = device.Name;
+                    }
+
+                    return new MikroTikActiveDeviceResult
+                    {
+                        Device = device,
+                        Users = users,
+                        Error = null
+                    };
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "فشل جلب Active من {Name}", d.Name);
-                    results.Add((d, new List<ActiveUser>(), ex.Message));
+                    _logger.LogWarning(ex, "فشل جلب Active من {Name}", device.Name);
+                    return new MikroTikActiveDeviceResult
+                    {
+                        Device = device,
+                        Users = new List<ActiveUser>(),
+                        Error = ex.Message
+                    };
                 }
-            }
-            return results;
+            }).ToArray();
+
+            var results = await Task.WhenAll(queries);
+            snapshot.DeviceResults.AddRange(results);
+            snapshot.Users.AddRange(results.SelectMany(r => r.Users));
+            return snapshot;
+        }
+
+        /// <summary>
+        /// يعيد لقطة حديثة جداً للحالات لا يزيد عمرها عن خمس ثوانٍ. هذا يمنع
+        /// كل تحميل للصفحة من فتح اتصال API جديد إلى كل راوتر، مع إبقاء الحالة
+        /// عملية للتشغيل اليومي.
+        /// </summary>
+        public async Task<MikroTikActiveUsersSnapshot> GetCachedActiveUsersSnapshotAsync()
+        {
+            if (_cache.TryGetValue(ActiveUsersCacheKey, out MikroTikActiveUsersSnapshot cached))
+                return cached;
+
+            var snapshot = await GetActiveUsersSnapshotAsync();
+            _cache.Set(ActiveUsersCacheKey, snapshot, TimeSpan.FromSeconds(5));
+            return snapshot;
+        }
+
+        /// <summary>واجهة التوافق القديمة لقائمة الجلسات حسب الجهاز.</summary>
+        public async Task<List<(MikroTikDevice Device, List<ActiveUser> Users, string Error)>> GetActiveUsersAllDevices()
+        {
+            var snapshot = await GetActiveUsersSnapshotAsync();
+            return snapshot.DeviceResults
+                .Select(r => (r.Device, r.Users, r.Error))
+                .ToList();
+        }
+
+        /// <summary>
+        /// يفصل جلسة العميل من الجهاز المرتبط بها فعلياً عندما لا يكون
+        /// MikroTikServerId محفوظاً للعميل القديم.
+        /// </summary>
+        public async Task<bool> KickActiveUserAcrossDevices(string username)
+        {
+            if (string.IsNullOrWhiteSpace(username))
+                return false;
+
+            var snapshot = await GetActiveUsersSnapshotAsync();
+            var activeUser = FindActiveUser(snapshot.Users, username);
+            if (activeUser == null)
+                return false;
+
+            if (activeUser.MikroTikDeviceId.HasValue)
+                return await KickActiveUserByDeviceId(username, activeUser.MikroTikDeviceId.Value);
+
+            return await KickActiveUser(username);
         }
 
         // =========================================================
@@ -824,7 +915,7 @@ namespace ISPSystem.Services
                     }
                 }
 
-                return anyKicked || rows.Count == 0;
+                return anyKicked;
             }
             catch (Exception ex)
             {
@@ -1466,12 +1557,14 @@ namespace ISPSystem.Services
             return (0, 0, "");
         }
 
-        public ActiveUser FindActiveUser(List<ActiveUser> list, string username)
+        public ActiveUser FindActiveUser(List<ActiveUser> list, string username, int? deviceId = null)
         {
-            if (list == null || string.IsNullOrEmpty(username)) return null;
+            if (list == null || string.IsNullOrWhiteSpace(username)) return null;
             foreach (var u in list)
             {
                 if (string.IsNullOrEmpty(u.Name)) continue;
+                if (deviceId.HasValue && u.MikroTikDeviceId != deviceId.Value) continue;
+
                 var a = u.Name; var b = username;
                 var as_ = a.Contains("@") ? a.Split('@')[0] : a;
                 var bs = b.Contains("@") ? b.Split('@')[0] : b;
@@ -1489,6 +1582,33 @@ namespace ISPSystem.Services
     // Models
     // =========================================================
 
+    public class MikroTikActiveDeviceResult
+    {
+        public MikroTikDevice Device { get; set; }
+        public List<ActiveUser> Users { get; set; } = new();
+        public string Error { get; set; }
+    }
+
+    public class MikroTikActiveUsersSnapshot
+    {
+        public bool DefaultRouterQueried { get; set; }
+        public List<MikroTikActiveDeviceResult> DeviceResults { get; } = new();
+        public List<ActiveUser> Users { get; } = new();
+
+        public bool WasRouterChecked(int? deviceId)
+        {
+            if (deviceId.HasValue && deviceId.Value > 0)
+            {
+                var result = DeviceResults.FirstOrDefault(r => r.Device?.Id == deviceId.Value);
+                return result != null && string.IsNullOrEmpty(result.Error);
+            }
+
+            // عميل قديم غير مرتبط براوتر: يمكن اعتماد عدم وجوده فقط عندما
+            // استجابت كل الأجهزة المفعّلة، أو استجاب الراوتر الافتراضي.
+            return DefaultRouterQueried || DeviceResults.All(r => string.IsNullOrEmpty(r.Error));
+        }
+    }
+
     public class ActiveUser
     {
         public string Name { get; set; }
@@ -1498,6 +1618,8 @@ namespace ISPSystem.Services
         public string Service { get; set; }
         public long BytesIn { get; set; }
         public long BytesOut { get; set; }
+        public int? MikroTikDeviceId { get; set; }
+        public string MikroTikDeviceName { get; set; }
     }
 
     public class PppUser
