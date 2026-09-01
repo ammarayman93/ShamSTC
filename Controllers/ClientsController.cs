@@ -94,73 +94,34 @@ namespace ISPSystem.Controllers
                 .Where(s => s != null)
                 .ToDictionary(s => s.ClientId);
 
-            // ========== حالة الاتصال: radacct (أساسي متعدد المواقع) + MikroTik API ==========
+            // حالة PPP الفعلية هي المصدر الأساسي. تُخزَّن اللقطة لخمس ثوانٍ
+            // كي لا تفتح كل صفحة اتصال API جديداً إلى كل راوتر.
             var onlineUsers = await _radius.GetOnlineUsers();
-
-            // خريطة اسم المستخدم -> IP من المايكروتيك (مقارنة بدون حساسية لحالة الأحرف)
-            var mikrotikOnline = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            try
-            {
-                var active = await _mikroTik.GetActiveUsers();
-                if (active != null)
-                {
-                    foreach (var u in active)
-                    {
-                        if (string.IsNullOrWhiteSpace(u.Name))
-                            continue;
-                        // خزّن بالاسم كما هو؛ المفتاح Case-Insensitive
-                        if (!mikrotikOnline.ContainsKey(u.Name))
-                            mikrotikOnline[u.Name] = u.Address ?? "";
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"MikroTik GetActiveUsers failed: {ex.Message}");
-            }
+            var mikroTikSnapshot = await _mikroTik.GetCachedActiveUsersSnapshotAsync();
 
             var data = clients.Select(c =>
             {
                 subDict.TryGetValue(c.Id, out var sub);
-                OnlineSessionInfo session = null;
-                if (!string.IsNullOrEmpty(c.Username))
-                    _radius.TryFindOnlineSession(onlineUsers, c.Username, out session);
+                OnlineSessionInfo radiusSession = null;
+                if (!string.IsNullOrWhiteSpace(c.Username))
+                    _radius.TryFindOnlineSession(onlineUsers, c.Username, out radiusSession);
 
-                // مطابقة مرنة لاسم المستخدم مع جلسات المايكروتيك
-                string mtIp = null;
-                bool onMikroTik = false;
-                if (!string.IsNullOrEmpty(c.Username))
-                {
-                    if (mikrotikOnline.TryGetValue(c.Username, out var ip1))
-                    {
-                        onMikroTik = true;
-                        mtIp = ip1;
-                    }
-                    else
-                    {
-                        // أحياناً المايكروتيك يعرض الاسم بدون النطاق أو العكس
-                        var shortName = c.Username.Contains("@")
-                            ? c.Username.Split('@')[0]
-                            : c.Username;
-                        foreach (var kv in mikrotikOnline)
-                        {
-                            var mtName = kv.Key;
-                            var mtShort = mtName.Contains("@") ? mtName.Split('@')[0] : mtName;
-                            if (string.Equals(mtName, c.Username, StringComparison.OrdinalIgnoreCase)
-                                || string.Equals(mtShort, shortName, StringComparison.OrdinalIgnoreCase)
-                                || string.Equals(mtName, shortName, StringComparison.OrdinalIgnoreCase)
-                                || string.Equals(mtShort, c.Username, StringComparison.OrdinalIgnoreCase))
-                            {
-                                onMikroTik = true;
-                                mtIp = kv.Value;
-                                break;
-                            }
-                        }
-                    }
-                }
+                // يقيّد العميل المرتبط بجهاز معيّن إلى ذلك الجهاز فقط. أما
+                // العملاء القدامى بلا تعيين فيُبحث عنهم في كل الأجهزة المفعّلة.
+                var mikroTikSession = _mikroTik.FindActiveUser(
+                    mikroTikSnapshot.Users,
+                    c.Username,
+                    c.MikroTikServerId)
+                    ?? _mikroTik.FindActiveUser(mikroTikSnapshot.Users, c.Username);
+                var routerWasChecked = mikroTikSession != null
+                    || mikroTikSnapshot.WasRouterChecked(c.MikroTikServerId);
 
-                // جلسة radacct كافية لاعتباره متصلاً حتى لو فشل API المايكروتيك
-                var isOnline = session != null || onMikroTik;
+                // لا نعرض radacct كـ "متصل" عندما استجاب الراوتر ولم تعد له
+                // جلسة PPP، لأن سجل المحاسبة قد يكون عالقاً بعد قطع مفاجئ.
+                var isOnline = mikroTikSession != null || (!routerWasChecked && radiusSession != null);
+                var onlineSource = mikroTikSession != null
+                    ? "mikrotik"
+                    : (!routerWasChecked && radiusSession != null ? "radius-unverified" : null);
 
                 return new
                 {
@@ -183,10 +144,12 @@ namespace ISPSystem.Controllers
                     c.PaymentStatus,
                     c.SecondaryPhone,
                     IsOnline = isOnline,
-                    OnlineIp = !string.IsNullOrEmpty(mtIp) ? mtIp : session?.FramedIp,
-                    OnlineMac = session?.MacAddress,
-                    OnlineSince = session?.StartTime,
-                    OnlineSource = session != null ? "radius" : (onMikroTik ? "mikrotik" : null),
+                    OnlineIp = mikroTikSession?.Address ?? radiusSession?.FramedIp,
+                    OnlineMac = radiusSession?.MacAddress ?? mikroTikSession?.CallerId,
+                    OnlineSince = radiusSession?.StartTime,
+                    OnlineSource = onlineSource,
+                    OnlineRouterId = mikroTikSession?.MikroTikDeviceId,
+                    OnlineRouterName = mikroTikSession?.MikroTikDeviceName,
                     DataUsed = "Bytes 0",
                     ActiveSubscription = sub == null ? null : new
                     {
@@ -225,48 +188,20 @@ namespace ISPSystem.Controllers
                 .OrderByDescending(s => s.EndDate)
                 .FirstOrDefaultAsync();
 
-            // حالة الاتصال: radacct أولاً ثم MikroTik API
-            bool isOnline = false;
-            string onlineIp = null;
-            try
-            {
-                var onlineMap = await _radius.GetOnlineUsers();
-                if (_radius.TryFindOnlineSession(onlineMap, client.Username, out var sess) && sess != null)
-                {
-                    isOnline = true;
-                    onlineIp = sess.FramedIp;
-                }
-            }
-            catch { /* ignore */ }
-
-            if (!isOnline)
-            {
-                try
-                {
-                    var active = await GetActiveUsersForClient(client);
-                    if (active != null)
-                    {
-                        foreach (var u in active)
-                        {
-                            if (string.IsNullOrEmpty(u.Name) || string.IsNullOrEmpty(client.Username))
-                                continue;
-                            var a = u.Name; var b = client.Username;
-                            var as_ = a.Contains("@") ? a.Split('@')[0] : a;
-                            var bs = b.Contains("@") ? b.Split('@')[0] : b;
-                            if (string.Equals(a, b, StringComparison.OrdinalIgnoreCase)
-                                || string.Equals(as_, bs, StringComparison.OrdinalIgnoreCase)
-                                || string.Equals(as_, b, StringComparison.OrdinalIgnoreCase)
-                                || string.Equals(a, bs, StringComparison.OrdinalIgnoreCase))
-                            {
-                                isOnline = true;
-                                onlineIp = u.Address;
-                                break;
-                            }
-                        }
-                    }
-                }
-                catch { /* ignore */ }
-            }
+            // استخدم نفس القاعدة المعتمدة في القائمة: جلسة PPP الفعلية أولاً،
+            // ولا نلجأ إلى radacct إلا عند تعذر فحص الراوتر المعني.
+            var onlineMap = await _radius.GetOnlineUsers();
+            _radius.TryFindOnlineSession(onlineMap, client.Username, out var radiusSession);
+            var mikroTikSnapshot = await _mikroTik.GetCachedActiveUsersSnapshotAsync();
+            var mikroTikSession = _mikroTik.FindActiveUser(
+                mikroTikSnapshot.Users,
+                client.Username,
+                client.MikroTikServerId)
+                ?? _mikroTik.FindActiveUser(mikroTikSnapshot.Users, client.Username);
+            var routerWasChecked = mikroTikSession != null
+                || mikroTikSnapshot.WasRouterChecked(client.MikroTikServerId);
+            var isOnline = mikroTikSession != null || (!routerWasChecked && radiusSession != null);
+            var onlineIp = mikroTikSession?.Address ?? radiusSession?.FramedIp;
 
             return Ok(ApiResponse<object>.Ok(new
             {
@@ -307,6 +242,11 @@ namespace ISPSystem.Controllers
                 client.ContractBackImage,
                 IsOnline = isOnline,
                 OnlineIp = onlineIp,
+                OnlineSource = mikroTikSession != null
+                    ? "mikrotik"
+                    : (!routerWasChecked && radiusSession != null ? "radius-unverified" : null),
+                OnlineRouterId = mikroTikSession?.MikroTikDeviceId,
+                OnlineRouterName = mikroTikSession?.MikroTikDeviceName,
                 ActiveSubscription = sub == null ? null : new
                 {
                     sub.Id,
@@ -643,7 +583,12 @@ namespace ISPSystem.Controllers
             if (!ok)
                 return BadRequest(ApiResponse<string>.Fail("فشل تحديث السرعة في RADIUS"));
 
-            // فصل الجلسة ليطبّق العميل السرعة الجديدة عند إعادة الاتصال
+            var appliedRate = await _radius.GetRateLimit(client.Username);
+            if (string.IsNullOrWhiteSpace(appliedRate))
+                return StatusCode(500, ApiResponse<string>.Fail("لم يتم حفظ حد السرعة في RADIUS"));
+
+            // لا يتبدل حد Mikrotik-Rate-Limit في جلسة PPP الموجودة. افصل
+            // الجلسة من الراوتر الصحيح كي يعيد العميل المصادقة بالحد الجديد.
             bool kicked = false;
             try { kicked = await KickClientSession(client); }
             catch (Exception ex) { Console.WriteLine($"Kick after speed: {ex.Message}"); }
@@ -653,10 +598,11 @@ namespace ISPSystem.Controllers
             return Ok(ApiResponse<object>.Ok(new
             {
                 message = kicked
-                    ? "تم تحديث السرعة وفصل الجلسة — سيُعاد الاتصال بالسرعة الجديدة"
-                    : "تم تحديث السرعة في RADIUS (لا توجد جلسة نشطة)",
+                    ? "تم حفظ حد السرعة وفصل الجلسة — سيُعاد اتصال العميل بالسرعة الجديدة"
+                    : "تم حفظ حد السرعة في RADIUS؛ لم تُكتشف جلسة PPP نشطة لفصلها",
                 username = client.Username,
-                speed = dto.Speed,
+                requestedSpeed = dto.Speed,
+                appliedRate,
                 sessionKicked = kicked
             }));
         }
@@ -1071,8 +1017,17 @@ namespace ISPSystem.Controllers
             try
             {
                 if (client.MikroTikServerId.HasValue && client.MikroTikServerId.Value > 0)
-                    return await _mikroTik.KickActiveUserByDeviceId(client.Username, client.MikroTikServerId.Value);
-                return await _mikroTik.KickActiveUser(client.Username);
+                {
+                    var kickedFromAssignedRouter = await _mikroTik.KickActiveUserByDeviceId(
+                        client.Username,
+                        client.MikroTikServerId.Value);
+                    if (kickedFromAssignedRouter)
+                        return true;
+                }
+
+                // العميل القديم أو ذو الربط الخاطئ: حدّد جلسة PPP أولاً ثم افصلها
+                // من الراوتر الذي توجد عليه، بدلاً من افتراض الراوتر الافتراضي.
+                return await _mikroTik.KickActiveUserAcrossDevices(client.Username);
             }
             catch (Exception ex)
             {
@@ -1081,12 +1036,14 @@ namespace ISPSystem.Controllers
             }
         }
 
-        /// <summary>جلب النشطين من راوتر العميل أو كل الأجهزة عند الحاجة</summary>
+        /// <summary>جلب النشطين من راوتر العميل أو كل الأجهزة عند الحاجة.</summary>
         private async Task<List<ActiveUser>> GetActiveUsersForClient(Client client)
         {
-            if (client?.MikroTikServerId.HasValue == true && client.MikroTikServerId.Value > 0)
-                return await _mikroTik.GetActiveUsersByDeviceId(client.MikroTikServerId.Value);
-            return await _mikroTik.GetActiveUsers();
+            // تُستخدم خصائص MikroTikDeviceId في ActiveUser لاختيار الراوتر
+            // للعمليات اللاحقة؛ وتُعاد القائمة الكاملة لاكتشاف العملاء القدامى
+            // أو ذوي الربط المخزّن الخاطئ.
+            var snapshot = await _mikroTik.GetCachedActiveUsersSnapshotAsync();
+            return snapshot.Users;
         }
 
     }

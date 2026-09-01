@@ -36,31 +36,24 @@ namespace ISPSystem.Controllers
                 var today = now.Date;
                 var threeDaysFromNow = today.AddDays(3);
 
-                // 1. عدد المتصلين: دمج MikroTik + radacct
-                var onlineClients = 0;
+                // 1. عدد المتصلين: جلسات PPP الفعلية من كل الراوترات. لا
+                // تُضاف حسابات radacct إلا عند تعذر الوصول إلى كل الراوترات.
                 var onlineNames = new System.Collections.Generic.HashSet<string>(System.StringComparer.OrdinalIgnoreCase);
-                try
+                var mikroTikSnapshot = await _mikroTik.GetCachedActiveUsersSnapshotAsync();
+                foreach (var user in mikroTikSnapshot.Users)
                 {
-                    var online = await _mikroTik.GetActiveUsers();
-                    if (online != null)
-                    {
-                        foreach (var u in online)
-                            if (!string.IsNullOrEmpty(u.Name))
-                                onlineNames.Add(u.Name);
-                    }
+                    if (!string.IsNullOrWhiteSpace(user.Name))
+                        onlineNames.Add(user.Name);
                 }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"MikroTik Connection Error: {ex.Message}");
-                }
-                try
+
+                if (!mikroTikSnapshot.WasRouterChecked(null))
                 {
                     var radOnline = await _radius.GetOnlineUsers();
-                    foreach (var k in radOnline.Keys)
-                        onlineNames.Add(k);
+                    foreach (var username in radOnline.Keys)
+                        onlineNames.Add(username);
                 }
-                catch { }
-                onlineClients = onlineNames.Count;
+
+                var onlineClients = onlineNames.Count;
 
                 // 2. إحصائيات العملاء
                 var totalClients = await _context.Clients.CountAsync();

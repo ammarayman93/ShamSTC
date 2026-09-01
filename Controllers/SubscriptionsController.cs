@@ -76,7 +76,20 @@ namespace ISPSystem.backend.Controllers
                 await _radius.EnableUser(client.Username);
                 if (!string.IsNullOrWhiteSpace(plan.Speed))
                     await _radius.UpdateSpeed(client.Username, plan.Speed);
-                try { await _mikroTik.KickActiveUser(client.Username); } catch { }
+                try
+                {
+                    var kicked = false;
+                    if (client.MikroTikServerId.HasValue && client.MikroTikServerId.Value > 0)
+                    {
+                        kicked = await _mikroTik.KickActiveUserByDeviceId(
+                            client.Username,
+                            client.MikroTikServerId.Value);
+                    }
+
+                    if (!kicked)
+                        await _mikroTik.KickActiveUserAcrossDevices(client.Username);
+                }
+                catch { }
 
                 // صندوق التفعيلات
                 decimal amount = plan.Price;

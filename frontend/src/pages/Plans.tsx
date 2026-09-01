@@ -275,12 +275,13 @@ export default function Plans() {
             />
             <TextField
               fullWidth
-              label="السرعة"
+              label="السرعة (رفع/تنزيل)"
               value={formData.speed}
               onChange={(e) => setFormData({ ...formData, speed: e.target.value })}
               margin="normal"
               required
-              placeholder="مثال: 4Mb/s"
+              placeholder="مثال: 5M/20M"
+              helperText="وفق صيغة MikroTik: القيمة الأولى لرفع العميل والثانية لتنزيله. استخدم 10M للسرعة المتناظرة."
             />
             <TextField
               fullWidth

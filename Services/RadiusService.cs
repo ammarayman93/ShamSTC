@@ -4,6 +4,8 @@ using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
+using System.Text.RegularExpressions;
+using System.Globalization;
 using ISPSystem.Models;
 
 namespace ISPSystem.Services
@@ -206,31 +208,66 @@ namespace ISPSystem.Services
         }
 
         /// <summary>
-        /// يحوّل أي صيغة شائعة إلى صيغة MikroTik: 10M/10M
+        /// يحوّل الإدخال إلى صيغة MikroTik-Rate-Limit: رفع/تنزيل، مثل 5M/20M.
+        /// RouterOS يفسّر القسم الأول كتدفق إلى الراوتر (رفع العميل)، والقسم
+        /// الثاني كتدفق من الراوتر (تنزيل العميل).
         /// </summary>
-        private string NormalizeSpeed(string speed)
+        private static string NormalizeSpeed(string speed)
         {
-            if (string.IsNullOrWhiteSpace(speed)) return "1M/1M";
+            if (string.IsNullOrWhiteSpace(speed))
+                return "1M/1M";
 
-            speed = speed.Trim()
-                .Replace("Mb/s", "M", StringComparison.OrdinalIgnoreCase)
-                .Replace("Mbps", "M", StringComparison.OrdinalIgnoreCase)
-                .Replace("mbps", "M", StringComparison.OrdinalIgnoreCase)
-                .Replace(" ", "");
-
-            if (!speed.Contains('/'))
+            var parts = speed.Trim().Split('/', StringSplitOptions.TrimEntries);
+            if (parts.Length == 1)
             {
-                if (!speed.EndsWith("M", StringComparison.OrdinalIgnoreCase)
-                    && !speed.EndsWith("k", StringComparison.OrdinalIgnoreCase)
-                    && !speed.EndsWith("G", StringComparison.OrdinalIgnoreCase)
-                    && !speed.EndsWith("K", StringComparison.OrdinalIgnoreCase))
-                {
-                    speed = speed + "M";
-                }
-                speed = $"{speed}/{speed}";
+                var symmetricRate = NormalizeSpeedPart(parts[0]);
+                return $"{symmetricRate}/{symmetricRate}";
             }
 
-            return speed;
+            if (parts.Length != 2 || string.IsNullOrWhiteSpace(parts[0]) || string.IsNullOrWhiteSpace(parts[1]))
+                throw new ArgumentException("صيغة السرعة يجب أن تكون مثل 10M أو 5M/20M");
+
+            return $"{NormalizeSpeedPart(parts[0])}/{NormalizeSpeedPart(parts[1])}";
+        }
+
+        private static string NormalizeSpeedPart(string value)
+        {
+            var normalized = value.Trim()
+                .Replace("Mb/s", "M", StringComparison.OrdinalIgnoreCase)
+                .Replace("Mbit/s", "M", StringComparison.OrdinalIgnoreCase)
+                .Replace("Mbps", "M", StringComparison.OrdinalIgnoreCase)
+                .Replace("Kbps", "k", StringComparison.OrdinalIgnoreCase)
+                .Replace("Kb/s", "k", StringComparison.OrdinalIgnoreCase)
+                .Replace(" ", "");
+
+            // يقبل RouterOS أرقاماً بوحدة k أو M أو G؛ وعند غياب الوحدة
+            // نتعامل معها كميغابت للحفاظ على سلوك النظام السابق.
+            var match = Regex.Match(normalized, @"^(?<rate>\d+(?:[\.,]\d+)?)(?<unit>[kKmMgG]?)$");
+            if (!match.Success)
+                throw new ArgumentException($"صيغة السرعة غير صالحة: {value}");
+
+            var rateText = match.Groups["rate"].Value.Replace(',', '.');
+            if (!decimal.TryParse(rateText, NumberStyles.Number, CultureInfo.InvariantCulture, out var rate) || rate <= 0)
+                throw new ArgumentException($"قيمة السرعة غير صالحة: {value}");
+
+            var unit = match.Groups["unit"].Value;
+            if (unit is "g" or "G")
+            {
+                // وثائق RouterOS تحدد k وM؛ حوّل G إلى M بدلاً من تمرير
+                // قيمة قد لا يتعرف عليها بعض الإصدارات.
+                rate *= 1000;
+                unit = "M";
+            }
+            else if (unit is "k" or "K")
+            {
+                unit = "k";
+            }
+            else
+            {
+                unit = "M";
+            }
+
+            return $"{rate.ToString("0.###", CultureInfo.InvariantCulture)}{unit}";
         }
 
         // ========== هل العميل متصل الآن؟ (من radacct) ==========
