@@ -72,8 +72,8 @@ services:
       Jwt__Audience: ISPSystemFrontend
       Logging__LogLevel__Default: Debug
       Logging__LogLevel__Microsoft.AspNetCore: Information
-      MikroTik__Ip: 10.50.0.2
-      MikroTik__ApiPort: 8728
+      MikroTik__Ip: ${MIKROTIK_IP:-10.50.0.2}
+      MikroTik__ApiPort: ${MIKROTIK_API_PORT:-8728}
       MikroTik__User: admin
       MikroTik__Pass: sham@#$
       MikroTik__Enabled: "true"
