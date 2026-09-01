@@ -2,6 +2,7 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using System;
+using System.Collections.Generic;
 using System.Threading.Tasks;
 using ISPSystem.Models;
 
@@ -32,7 +33,15 @@ namespace ISPSystem.Services
                     "INSERT INTO radcheck (username, attribute, op, value) VALUES (@u,'Cleartext-Password',':=',@p)",
                     ("@u", username), ("@p", password));
 
-                if (!string.IsNullOrWhiteSpace(speed))
+                // خصائص PPP الأساسية — مطلوبة لمايكروتيك
+                await Exec(conn,
+                    "INSERT INTO radreply (username, attribute, op, value) VALUES (@u,'Framed-Protocol',':=','PPP')",
+                    ("@u", username));
+                await Exec(conn,
+                    "INSERT INTO radreply (username, attribute, op, value) VALUES (@u,'Service-Type',':=','Framed-User')",
+                    ("@u", username));
+
+                // السرعة دائماً (افتراضي 1M/1M إن لم تُمرَّر)
                 {
                     var rate = NormalizeSpeed(speed);
                     await Exec(conn,
@@ -49,13 +58,13 @@ namespace ISPSystem.Services
                         ("@u", username), ("@e", exp));
                 }
 
-                _logger.LogInformation("RADIUS CreateUser OK: {User}", username);
+                _logger.LogInformation("RADIUS CreateUser OK: {User} rate={Rate}", username, NormalizeSpeed(speed));
                 return true;
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "RADIUS CreateUser failed: {User}", username);
-                return false; // لا يرمي Exception حتى لا يطيح التطبيق
+                return false;
             }
         }
 
@@ -105,6 +114,9 @@ namespace ISPSystem.Services
                 await Exec(conn,
                     "INSERT INTO radreply (username, attribute, op, value) VALUES (@u,'Mikrotik-Rate-Limit',':=',@s)",
                     ("@u", username), ("@s", rate));
+
+                // تأكيد وجود خصائص PPP
+                await EnsurePppReplyAttrs(conn, username);
                 return true;
             }
             catch (Exception ex)
@@ -157,6 +169,34 @@ namespace ISPSystem.Services
             await Exec(conn, "DELETE FROM radusergroup WHERE username=@u", ("@u", username));
         }
 
+        private async Task EnsurePppReplyAttrs(MySqlConnection conn, string username)
+        {
+            await using (var cmd = new MySqlCommand(
+                "SELECT COUNT(*) FROM radreply WHERE username=@u AND attribute='Framed-Protocol'", conn))
+            {
+                cmd.Parameters.AddWithValue("@u", username);
+                var c = Convert.ToInt32(await cmd.ExecuteScalarAsync());
+                if (c == 0)
+                {
+                    await Exec(conn,
+                        "INSERT INTO radreply (username, attribute, op, value) VALUES (@u,'Framed-Protocol',':=','PPP')",
+                        ("@u", username));
+                }
+            }
+            await using (var cmd = new MySqlCommand(
+                "SELECT COUNT(*) FROM radreply WHERE username=@u AND attribute='Service-Type'", conn))
+            {
+                cmd.Parameters.AddWithValue("@u", username);
+                var c = Convert.ToInt32(await cmd.ExecuteScalarAsync());
+                if (c == 0)
+                {
+                    await Exec(conn,
+                        "INSERT INTO radreply (username, attribute, op, value) VALUES (@u,'Service-Type',':=','Framed-User')",
+                        ("@u", username));
+                }
+            }
+        }
+
         private async Task Exec(MySqlConnection conn, string sql, params (string n, object v)[] ps)
         {
             await using var cmd = new MySqlCommand(sql, conn);
@@ -165,13 +205,34 @@ namespace ISPSystem.Services
             await cmd.ExecuteNonQueryAsync();
         }
 
+        /// <summary>
+        /// يحوّل أي صيغة شائعة إلى صيغة MikroTik: 10M/10M
+        /// </summary>
         private string NormalizeSpeed(string speed)
         {
             if (string.IsNullOrWhiteSpace(speed)) return "1M/1M";
-            speed = speed.Replace("Mb/s", "M").Replace("Mbps", "M").Trim();
-            if (!speed.Contains("/")) speed = $"{speed}/{speed}";
+
+            speed = speed.Trim()
+                .Replace("Mb/s", "M", StringComparison.OrdinalIgnoreCase)
+                .Replace("Mbps", "M", StringComparison.OrdinalIgnoreCase)
+                .Replace("mbps", "M", StringComparison.OrdinalIgnoreCase)
+                .Replace(" ", "");
+
+            if (!speed.Contains('/'))
+            {
+                if (!speed.EndsWith("M", StringComparison.OrdinalIgnoreCase)
+                    && !speed.EndsWith("k", StringComparison.OrdinalIgnoreCase)
+                    && !speed.EndsWith("G", StringComparison.OrdinalIgnoreCase)
+                    && !speed.EndsWith("K", StringComparison.OrdinalIgnoreCase))
+                {
+                    speed = speed + "M";
+                }
+                speed = $"{speed}/{speed}";
+            }
+
             return speed;
         }
+
         // ========== هل العميل متصل الآن؟ (من radacct) ==========
         public async Task<bool> IsUserOnline(string username)
         {
@@ -181,8 +242,8 @@ namespace ISPSystem.Services
                 await conn.OpenAsync();
 
                 await using var cmd = new MySqlCommand(
-                    @"SELECT COUNT(*) FROM radacct 
-              WHERE username = @u AND acctstoptime IS NULL",
+                    @"SELECT COUNT(*) FROM radacct
+                      WHERE username = @u AND acctstoptime IS NULL",
                     conn);
                 cmd.Parameters.AddWithValue("@u", username);
 
@@ -196,6 +257,36 @@ namespace ISPSystem.Services
             }
         }
 
+        /// <summary>مطابقة مرنة لاسم المستخدم مع مفاتيح جلسات radacct</summary>
+        public bool TryFindOnlineSession(
+            Dictionary<string, OnlineSessionInfo> map,
+            string username,
+            out OnlineSessionInfo session)
+        {
+            session = null;
+            if (map == null || string.IsNullOrWhiteSpace(username))
+                return false;
+
+            if (map.TryGetValue(username, out session) && session != null)
+                return true;
+
+            var shortName = username.Contains('@') ? username.Split('@')[0] : username;
+            foreach (var kv in map)
+            {
+                var k = kv.Key ?? "";
+                var kShort = k.Contains('@') ? k.Split('@')[0] : k;
+                if (string.Equals(k, username, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(kShort, shortName, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(k, shortName, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(kShort, username, StringComparison.OrdinalIgnoreCase))
+                {
+                    session = kv.Value;
+                    return session != null;
+                }
+            }
+            return false;
+        }
+
         // ========== جلب كل المستخدمين المتصلين حالياً ==========
         public async Task<Dictionary<string, OnlineSessionInfo>> GetOnlineUsers()
         {
@@ -206,11 +297,11 @@ namespace ISPSystem.Services
                 await conn.OpenAsync();
 
                 await using var cmd = new MySqlCommand(
-                    @"SELECT username, framedipaddress, callingstationid, 
-                     acctstarttime, nasipaddress, acctsessionid
-              FROM radacct 
-              WHERE acctstoptime IS NULL
-              ORDER BY acctstarttime DESC",
+                    @"SELECT username, framedipaddress, callingstationid,
+                             acctstarttime, nasipaddress, acctsessionid
+                      FROM radacct
+                      WHERE acctstoptime IS NULL
+                      ORDER BY acctstarttime DESC",
                     conn);
 
                 await using var reader = await cmd.ExecuteReaderAsync();
@@ -239,7 +330,6 @@ namespace ISPSystem.Services
         }
 
         // ========== فصل الجلسة (إغلاق محاسبي + Reject) ==========
-        // ملاحظة: فصل الجلسة الفعلية على المايكروتيك يتم عبر MikroTikService.KickActiveUser
         public async Task<bool> DisconnectUser(string username)
         {
             try
@@ -248,9 +338,9 @@ namespace ISPSystem.Services
                 await conn.OpenAsync();
 
                 await Exec(conn,
-                    @"UPDATE radacct SET acctstoptime = NOW(), 
-              acctterminatecause = 'Admin-Reset'
-              WHERE username = @u AND acctstoptime IS NULL",
+                    @"UPDATE radacct SET acctstoptime = NOW(),
+                      acctterminatecause = 'Admin-Reset'
+                      WHERE username = @u AND acctstoptime IS NULL",
                     ("@u", username));
 
                 await DisableUser(username);
@@ -263,8 +353,6 @@ namespace ISPSystem.Services
             }
         }
 
-        // ========== جلب كلمة المرور الصريحة من radcheck (للعرض للأدمن فقط) ==========
-        
         public async Task<object> GetUserUsage(string username)
         {
             long sessionIn = 0, sessionOut = 0, totalIn = 0, totalOut = 0;
@@ -366,7 +454,7 @@ namespace ISPSystem.Services
             return string.Format("{0:0.##} {1}", v, u[i]);
         }
 
-public async Task<string> GetCleartextPassword(string username)
+        public async Task<string> GetCleartextPassword(string username)
         {
             try
             {
@@ -374,7 +462,7 @@ public async Task<string> GetCleartextPassword(string username)
                 await conn.OpenAsync();
 
                 await using var cmd = new MySqlCommand(
-                    @"SELECT value FROM radcheck 
+                    @"SELECT value FROM radcheck
                       WHERE username = @u AND attribute = 'Cleartext-Password'
                       LIMIT 1",
                     conn);
@@ -390,7 +478,6 @@ public async Task<string> GetCleartextPassword(string username)
             }
         }
 
-        // ========== تحديث السرعة + الإرجاع ==========
         public async Task<(bool Ok, string Rate)> UpdateSpeedWithRate(string username, string speed)
         {
             var rate = NormalizeSpeed(speed);

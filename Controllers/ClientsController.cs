@@ -1,5 +1,5 @@
 #nullable disable
-﻿using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using ISPSystem.Data;
@@ -94,8 +94,7 @@ namespace ISPSystem.Controllers
                 .Where(s => s != null)
                 .ToDictionary(s => s.ClientId);
 
-            // ========== حالة الاتصال: MikroTik (أساسي) + radacct (ثانوي) ==========
-            // ملاحظة: radacct غالباً لا يتحدث فوراً؛ المايكروتيك هو المصدر الحقيقي للمتصلين
+            // ========== حالة الاتصال: radacct (أساسي متعدد المواقع) + MikroTik API ==========
             var onlineUsers = await _radius.GetOnlineUsers();
 
             // خريطة اسم المستخدم -> IP من المايكروتيك (مقارنة بدون حساسية لحالة الأحرف)
@@ -123,7 +122,9 @@ namespace ISPSystem.Controllers
             var data = clients.Select(c =>
             {
                 subDict.TryGetValue(c.Id, out var sub);
-                onlineUsers.TryGetValue(c.Username, out var session);
+                OnlineSessionInfo session = null;
+                if (!string.IsNullOrEmpty(c.Username))
+                    _radius.TryFindOnlineSession(onlineUsers, c.Username, out session);
 
                 // مطابقة مرنة لاسم المستخدم مع جلسات المايكروتيك
                 string mtIp = null;
@@ -158,7 +159,8 @@ namespace ISPSystem.Controllers
                     }
                 }
 
-                var isOnline = onMikroTik || session != null;
+                // جلسة radacct كافية لاعتباره متصلاً حتى لو فشل API المايكروتيك
+                var isOnline = session != null || onMikroTik;
 
                 return new
                 {
@@ -184,7 +186,7 @@ namespace ISPSystem.Controllers
                     OnlineIp = !string.IsNullOrEmpty(mtIp) ? mtIp : session?.FramedIp,
                     OnlineMac = session?.MacAddress,
                     OnlineSince = session?.StartTime,
-                    OnlineSource = onMikroTik ? "mikrotik" : (session != null ? "radius" : null),
+                    OnlineSource = session != null ? "radius" : (onMikroTik ? "mikrotik" : null),
                     DataUsed = "Bytes 0",
                     ActiveSubscription = sub == null ? null : new
                     {
@@ -223,34 +225,48 @@ namespace ISPSystem.Controllers
                 .OrderByDescending(s => s.EndDate)
                 .FirstOrDefaultAsync();
 
-            // حالة الاتصال
+            // حالة الاتصال: radacct أولاً ثم MikroTik API
             bool isOnline = false;
             string onlineIp = null;
             try
             {
-                var active = await _mikroTik.GetActiveUsers();
-                if (active != null)
+                var onlineMap = await _radius.GetOnlineUsers();
+                if (_radius.TryFindOnlineSession(onlineMap, client.Username, out var sess) && sess != null)
                 {
-                    foreach (var u in active)
-                    {
-                        if (string.IsNullOrEmpty(u.Name) || string.IsNullOrEmpty(client.Username))
-                            continue;
-                        var a = u.Name; var b = client.Username;
-                        var as_ = a.Contains("@") ? a.Split('@')[0] : a;
-                        var bs = b.Contains("@") ? b.Split('@')[0] : b;
-                        if (string.Equals(a, b, StringComparison.OrdinalIgnoreCase)
-                            || string.Equals(as_, bs, StringComparison.OrdinalIgnoreCase)
-                            || string.Equals(as_, b, StringComparison.OrdinalIgnoreCase)
-                            || string.Equals(a, bs, StringComparison.OrdinalIgnoreCase))
-                        {
-                            isOnline = true;
-                            onlineIp = u.Address;
-                            break;
-                        }
-                    }
+                    isOnline = true;
+                    onlineIp = sess.FramedIp;
                 }
             }
             catch { /* ignore */ }
+
+            if (!isOnline)
+            {
+                try
+                {
+                    var active = await GetActiveUsersForClient(client);
+                    if (active != null)
+                    {
+                        foreach (var u in active)
+                        {
+                            if (string.IsNullOrEmpty(u.Name) || string.IsNullOrEmpty(client.Username))
+                                continue;
+                            var a = u.Name; var b = client.Username;
+                            var as_ = a.Contains("@") ? a.Split('@')[0] : a;
+                            var bs = b.Contains("@") ? b.Split('@')[0] : b;
+                            if (string.Equals(a, b, StringComparison.OrdinalIgnoreCase)
+                                || string.Equals(as_, bs, StringComparison.OrdinalIgnoreCase)
+                                || string.Equals(as_, b, StringComparison.OrdinalIgnoreCase)
+                                || string.Equals(a, bs, StringComparison.OrdinalIgnoreCase))
+                            {
+                                isOnline = true;
+                                onlineIp = u.Address;
+                                break;
+                            }
+                        }
+                    }
+                }
+                catch { /* ignore */ }
+            }
 
             return Ok(ApiResponse<object>.Ok(new
             {
@@ -646,7 +662,7 @@ namespace ISPSystem.Controllers
         }
 
         // 🔑 إعادة تعيين كلمة المرور (وعرضها مرة واحدة)
-        
+
         /// <summary>إحصاءات حية: استهلاك، IP، سرعات، عدد أجهزة تقريبي</summary>
         [HttpGet("{id}/live-stats")]
         public async Task<IActionResult> GetLiveStats(int id)
@@ -674,7 +690,7 @@ namespace ISPSystem.Controllers
 
             try
             {
-                var active = await _mikroTik.GetActiveUsers();
+                var active = await GetActiveUsersForClient(client);
                 var u = _mikroTik.FindActiveUser(active, client.Username);
                 if (u != null)
                 {
@@ -694,6 +710,30 @@ namespace ISPSystem.Controllers
             catch (Exception ex)
             {
                 Console.WriteLine($"live-stats mikrotik: {ex.Message}");
+            }
+
+            // إن لم يظهر من API → radacct
+            if (!isOnline)
+            {
+                try
+                {
+                    var onlineMap = await _radius.GetOnlineUsers();
+                    if (_radius.TryFindOnlineSession(onlineMap, client.Username, out var sess) && sess != null)
+                    {
+                        isOnline = true;
+                        onlineIp = sess.FramedIp;
+                        callerId = sess.MacAddress;
+                        if (sess.StartTime.HasValue)
+                        {
+                            var span = DateTime.Now - sess.StartTime.Value;
+                            uptime = $"{(int)span.TotalHours:D2}:{span.Minutes:D2}:{span.Seconds:D2}";
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"live-stats radacct: {ex.Message}");
+                }
             }
 
             // تنسيق سرعات البت إلى نص مقروء
